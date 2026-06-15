@@ -27,27 +27,27 @@ AFAC2026/
 ├── open_projects/
 │   └── PageIndex/                         # git submodule，不修改
 ├── data/
-│   └── public_dataset_upload/
-│       ├── raw/                           # 原始 PDF/HTML 文档
-│       │   ├── financial_contracts/       # 金融合同（债券募集说明书）
-│       │   ├── financial_reports/         # 上市公司年度报告
-│       │   ├── insurance/                 # 保险产品条款
-│       │   └── regulatory/               # 监管法规
-│       │       ├── html/                  # 法规 HTML
-│       │       └── attachments/           # 法规附件 PDF
-│       └── questions/
-│           └── group_a/
-│               ├── financial_contracts_questions.json
-│               ├── financial_reports_questions.json
-│               ├── insurance_questions.json
-│               ├── regulatory_questions.json
-│               └── research_questions.json
-├── processed_data/
-│   ├── markdown/                          # PDF 解析后的 Markdown，可选
-│   ├── pages/                             # 页级文本缓存
-│   ├── pageindex/                         # PageIndex 树索引
-│   ├── catalog/doc_catalog.jsonl          # B榜候选文档检索用元数据
-│   └── quality/index_quality.jsonl
+│   ├── public_dataset_upload/
+│   │   ├── raw/                           # 原始 PDF/HTML 文档
+│   │   │   ├── financial_contracts/       # 金融合同（债券募集说明书）
+│   │   │   ├── financial_reports/         # 上市公司年度报告
+│   │   │   ├── insurance/                 # 保险产品条款
+│   │   │   └── regulatory/               # 监管法规
+│   │   │       ├── html/                  # 法规 HTML
+│   │   │       └── attachments/           # 法规附件 PDF
+│   │   └── questions/
+│   │       └── group_a/
+│   │           ├── financial_contracts_questions.json
+│   │           ├── financial_reports_questions.json
+│   │           ├── insurance_questions.json
+│   │           ├── regulatory_questions.json
+│   │           └── research_questions.json
+│   └── processed_data/
+│       ├── markdown/                      # PDF 解析后的 Markdown，可选
+│       ├── pages/                         # 页级文本缓存
+│       ├── pageindex/                     # PageIndex 树索引
+│       ├── catalog/doc_catalog.jsonl      # B榜候选文档检索用元数据
+│       └── quality/index_quality.jsonl
 ├── agent/
 │   ├── pageindex_adapter.py               # 封装 PageIndex
 │   ├── qwen_client.py                     # 统一 Qwen API 与 Token 统计
@@ -250,7 +250,7 @@ Markdown 模式在不生成摘要时基本不需要 LLM 调用，适合大规模
 
 ## 5. 索引质量检查
 
-离线构建后，应生成 `processed_data/quality/index_quality.jsonl`。建议至少检查：
+离线构建后，应生成 `data/processed_data/quality/index_quality.jsonl`。建议至少检查：
 
 ```python
 from __future__ import annotations
@@ -345,7 +345,7 @@ class FinancePageIndexStore:
         return f"{start}-{end}" if start != end else str(start)
 ```
 
-页级文本建议由项目预处理保存到 `processed_data/pages/{doc_id}.jsonl`，不要依赖 PyPDF2 实时读取。读取接口示例：
+页级文本建议由项目预处理保存到 `data/processed_data/pages/{doc_id}.jsonl`，不要依赖 PyPDF2 实时读取。读取接口示例：
 
 ```python
     @lru_cache(maxsize=4096)
@@ -862,7 +862,7 @@ pi_md.llm_acompletion = tracked_llm_acompletion
 1. 读取赛题原始文档目录 data/public_dataset_upload/raw/ 下的所有 PDF/HTML。
 2. 对每个 PDF 做解析，生成 pages 缓存和可选 Markdown。
 3. 调用 PageIndex 生成结构树，doc_id 采用原始文件名（不含扩展名）。
-4. 保存 processed_data/pageindex/{doc_id}.json。
+4. 保存 data/processed_data/pageindex/{doc_id}.json。
 5. 生成 doc_catalog.jsonl（基于文件名、领域、章节标题等元数据）。
 6. 跑索引质量检查。
 ```
@@ -872,9 +872,9 @@ pi_md.llm_acompletion = tracked_llm_acompletion
 ```bash
 python scripts/build_pageindex.py \
   --raw-dir data/public_dataset_upload/raw \
-  --markdown-dir processed_data/markdown \
-  --page-dir processed_data/pages \
-  --index-dir processed_data/pageindex \
+  --markdown-dir data/processed_data/markdown \
+  --page-dir data/processed_data/pages \
+  --index-dir data/processed_data/pageindex \
   --model dashscope/qwen3.6-plus \
   --no-summary
 ```
@@ -1096,9 +1096,9 @@ model:
 
 为了满足复现与审核，建议保留：
 
-- `processed_data/pageindex/*.json`：PageIndex 树索引。
-- `processed_data/pages/*.jsonl`：页级文本。
-- `processed_data/catalog/doc_catalog.jsonl`：B 榜候选召回数据。
+- `data/processed_data/pageindex/*.json`：PageIndex 树索引。
+- `data/processed_data/pages/*.jsonl`：页级文本。
+- `data/processed_data/catalog/doc_catalog.jsonl`：B 榜候选召回数据。
 - `outputs/evidence.json`：每题证据定位。
 - `outputs/logs/*.jsonl`：每次模型调用的 prompt 摘要、模型名、usage、qid、阶段。
 - `requirements.txt`：包含 PageIndex requirements 与项目依赖。
