@@ -32,9 +32,11 @@ AFAC2026/
 │   │   │   ├── financial_contracts/       # 金融合同（债券募集说明书）
 │   │   │   ├── financial_reports/         # 上市公司年度报告
 │   │   │   ├── insurance/                 # 保险产品条款
-│   │   │   └── regulatory/               # 监管法规
-│   │   │       ├── html/                  # 法规 HTML
-│   │   │       └── attachments/           # 法规附件 PDF
+│   │   │   ├── regulatory/                # 监管法规
+│   │   │   │   ├── html/                  # 法规 HTML
+│   │   │   │   ├── attachments/           # 法规附件 PDF
+│   │   │   │   └── txt/                   # 已清洗法规文本
+│   │   │   └── research/                  # 行业研报
 │   │   └── questions/
 │   │       └── group_a/
 │   │           ├── financial_contracts_questions.json
@@ -70,6 +72,8 @@ AFAC2026/
 │   └── logs/
 └── README.md
 ```
+
+当前数据包含 `raw/research/` 行业研报目录；监管目录同时包含 HTML、附件 PDF 和 TXT 三类文件。
 
 ## 3. 环境接入方式
 
@@ -345,9 +349,14 @@ class FinancePageIndexStore:
         return f"{start}-{end}" if start != end else str(start)
 ```
 
-页级文本建议由项目预处理保存到 `data/processed_data/pages/{doc_id}.jsonl`，不要依赖 PyPDF2 实时读取。读取接口示例：
+注意：上面的 `node_to_page_range()` 只适用于 PDF 索引，因为 PDF 模式的节点有 `start_index/end_index`。Markdown 模式的 `md_to_tree()` 输出的是 `line_num`，不是 PDF 页码；如果用 Markdown 路线，预处理阶段必须额外保存 `line_num -> source_page` 或 `node_id -> source_page_range` 映射，树检索选中节点后通过该映射回到页级文本缓存。
+
+页级文本建议由项目预处理保存到 `data/processed_data/pages/{doc_id}.jsonl`，不要依赖 PyPDF2 实时读取。下面代码是 `FinancePageIndexStore` 的类内部方法片段，不能作为独立 Python 文件直接运行：
 
 ```python
+class FinancePageIndexStore:
+    ...
+
     @lru_cache(maxsize=4096)
     def get_page(self, doc_id: str, page: int) -> str:
         if self.page_dir is None:
@@ -711,6 +720,8 @@ print(pct("8", "120"))
 
 所有正式检索、压缩、证据判断、答案生成和自检调用都应经过统一客户端，记录 usage。
 
+下面是接口草图，假设底层客户端兼容 OpenAI Chat Completions 风格；实际接入百炼或魔搭社区时，应按平台 SDK 调整 `resp` 的字段读取方式。
+
 ```python
 from __future__ import annotations
 
@@ -752,11 +763,11 @@ class QwenClient:
         return safe_json_loads(content)
 ```
 
-`safe_json_loads()` 应实现代码块清理、尾逗号修复、schema 校验和重试。
+`safe_json_loads()` 应实现代码块清理、尾逗号修复、schema 校验和失败重试。若平台响应缺少 `usage`，应在日志中显式记录 `usage_missing=true`，并用平台返回的 Token 统计接口或本地估算只作辅助排查，不能把缺失统计静默当作 0。
 
 ### 14.2 PageIndex 内部调用的统计
 
-PageIndex 源码中的 `llm_completion()` 和 `llm_acompletion()` 没有返回 usage。若正式流程中需要运行 PageIndex LLM 索引或摘要，并且这些调用需要计入统计，可以用运行时 monkeypatch，而不修改源码文件。
+PageIndex 源码中的 `llm_completion()` 和 `llm_acompletion()` 没有返回 usage。PDF 模式即使关闭摘要，也会调用 LLM 做目录识别、目录 JSON 转换、章节树生成、页码修正和校验；只有 Markdown 模式在不生成摘要/文档描述时基本不触发 LLM。若正式流程中需要运行 PageIndex LLM 索引或摘要，并且这些调用需要计入统计，可以用运行时 monkeypatch，而不修改源码文件。
 
 思路：
 
@@ -775,7 +786,9 @@ pi_md.llm_completion = tracked_llm_completion
 pi_md.llm_acompletion = tracked_llm_acompletion
 ```
 
-更简单的工程建议是：PageIndex 索引构建作为题目无关的离线预处理；正式答题阶段只读取索引文件，不触发 PageIndex 内部 LLM 调用。
+`tracked_llm_completion` 必须兼容 PageIndex 源码签名：`tracked_llm_completion(model, prompt, chat_history=None, return_finish_reason=False)`；当 `return_finish_reason=True` 时必须返回 `(content, finish_reason)`。`tracked_llm_acompletion` 必须是异步函数，并兼容 `llm_acompletion(model, prompt)`。
+
+更简单的工程建议是：PageIndex 索引构建作为题目无关的离线预处理，并单独保留索引构建日志；正式答题阶段只读取索引文件，不触发 PageIndex 内部 LLM 调用。提交用 Token 统计应覆盖正式检索、压缩、判断、生成和自检，不把离线题目无关预处理成本混入每题答题统计。
 
 ### 14.3 缓存策略
 
@@ -808,7 +821,7 @@ pi_md.llm_acompletion = tracked_llm_acompletion
 
 ### 15.2 监管法规
 
-赛题监管数据包含 200 份证监会法规 HTML 及其附件 PDF，doc_id 格式为 `strict_v3_XXX_法规名称`。题目多为跨法规比较、条文细节判断。
+赛题监管数据为混合来源，包含法规 HTML、附件 PDF 和少量已清洗 TXT。doc_id 以原始文件 basename 为准，常见格式包括 `strict_v3_XXX_法规名称`、`csrc_XXXX` 和 `csrc_XXXX_attN`。题目多为跨法规比较、条文细节判断。
 
 查询扩展词：
 
@@ -832,7 +845,7 @@ pi_md.llm_acompletion = tracked_llm_acompletion
 
 ### 15.4 财务报表
 
-赛题财报数据为 10 份上市公司年度报告 PDF，涵盖比亚迪、宁德时代、中国移动、招商银行、中国建筑、美的集团六家公司两年对比。doc_id 格式为 `annual_{公司英文名}_{年份}_report`。
+赛题财报数据为 10 份上市公司年度报告 PDF，涵盖比亚迪、宁德时代、中国移动、招商银行、中国建筑、美的集团等公司；其中部分公司是跨年对比，部分公司只有单年文档。doc_id 格式为 `annual_{公司英文名}_{年份}_report`。
 
 查询扩展词：
 
@@ -881,6 +894,8 @@ python scripts/build_pageindex.py \
 
 ### 16.2 在线答题阶段
 
+下面伪代码中的 `retrieve_candidate_docs()`、`retrieve_nodes_with_pageindex_tree()`、`node_ids_to_page_ranges()`、`extract_evidence_by_option()`、`judge_options_and_normalize()` 都是项目侧待实现接口，不是 PageIndex 自带 API。PageIndex 只提供结构树和按页/行读取能力。
+
 ```text
 for question in questions:
     parse question and options
@@ -919,13 +934,13 @@ fin_a_001,AC,12000,300,12300
 {
   "qid": "fin_a_001",
   "answer": "AC",
-  "candidate_docs": ["byd_2024_annual", "byd_2025_annual"],
+  "candidate_docs": ["annual_byd_2024_report", "annual_byd_2025_report"],
   "selected_nodes": [
-    {"doc_id": "byd_2024_annual", "node_id": "0012", "title": "主要会计数据和财务指标", "pages": "8-10"}
+    {"doc_id": "annual_byd_2024_report", "node_id": "0012", "title": "主要会计数据和财务指标", "pages": "8-10"}
   ],
   "evidence_retrieval": [
     {
-      "doc_id": "byd_2024_annual",
+      "doc_id": "annual_byd_2024_report",
       "node_id": "0012",
       "pages": "8-10",
       "quote": "...",
@@ -1142,10 +1157,10 @@ model:
 优先采用“Markdown PageIndex + Qwen 树检索 + 页级证据记忆”的组合：
 
 1. 用高质量解析工具把 PDF 转为 Markdown 和页级文本。
-2. 用 `md_to_tree()` 构建无摘要树，保留 `title/node_id/line_num`；PDF 页码另由页缓存维护。
+2. 用 `md_to_tree()` 构建无摘要树，保留 `title/node_id/line_num`；同时保存 `line_num -> source_page` 或 `node_id -> source_page_range`，因为 `line_num` 不是 PDF 页码。
 3. 对 A 榜直接使用 `doc_ids`；对 B 榜用 doc catalog + Qwen 选择候选文档。
 4. 对每个候选文档运行 PageIndex 树检索，选择少量节点。
-5. 读取紧凑页段，按选项抽取证据。
+5. 通过页码映射读取紧凑页段，按选项抽取证据。
 6. 用证据记忆和程序化计算完成最终判断。
 7. 输出标准答案和可审核证据。
 
