@@ -105,6 +105,26 @@ Thumbs.db
 # Logs
 *.log
 
+# Archives / compressed files
+*.7z
+*.br
+*.bz2
+*.gz
+*.gzip
+*.rar
+*.tar
+*.tar.bz2
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.tbz
+*.tbz2
+*.tgz
+*.txz
+*.xz
+*.zip
+*.zst
+
 # Project data / outputs
 data/
 outputs/
