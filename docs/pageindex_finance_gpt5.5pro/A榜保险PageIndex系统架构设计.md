@@ -1,0 +1,587 @@
+# A榜保险 PageIndex 系统架构设计
+
+## 1. 设计目标
+
+本文档定义一个面向 A 榜保险条款题目的 PageIndex 问答系统架构。当前任务只处理：
+
+- 题目范围：`data/public_dataset_upload/questions/group_a/insurance_questions.json`
+- 文档范围：`data/public_dataset_upload/raw/insurance` 下的 16 个 PDF
+- 领域范围：`domain=insurance`
+- 榜单范围：`split=A`
+
+系统目标是在不修改 `open_projects/PageIndex` 源码的前提下，把 PageIndex 作为文档内部结构索引组件，用于定位保险条款证据页段；项目侧负责题目解析、节点选择、证据抽取、计算、答案判断、Token 统计和结果导出。
+
+当前版本不实现 B 榜候选文档召回，但在配置、数据产物和模块边界上保留扩展点，后续可扩展到 B 榜以及监管法规、金融合同、财务报表、行业研报等领域。
+
+## 2. 核心约束
+
+| 约束 | 设计处理 |
+| --- | --- |
+| A 榜题目提供 `doc_ids` | 主流程直接使用题目给定文档，不做候选文档召回。 |
+| 保险数据为 16 个 PDF | 离线阶段为每个 PDF 生成页级缓存和 PageIndex 树索引。 |
+| 多数保险 PDF 没有可靠 PDF 目录 | 采用 Markdown 优先、PDF 直连兜底的双路线并行索引策略。 |
+| PageIndex 是第三方源码 | 只通过薄封装调用，不修改 `open_projects/PageIndex`。 |
+| 正式推理问答阶段模型限制 | 文档定位、证据判断、答案生成、自检等正式推理调用使用 Qwen 系列并统计 Token。 |
+| `docs/模型配置.md` 中存在 ARK 配置 | ARK 兼容 OpenAI 协议配置仅作为开发调试配置，不作为正式赛题推理模型假设。 |
+
+## 3. 总体架构
+
+系统分为六层：
+
+```text
+原始保险 PDF
+  -> 文档解析层
+  -> PageIndex 结构索引层
+  -> 保险题检索层
+  -> 证据记忆层
+  -> 答案推理层
+  -> 输出与审计层
+```
+
+### 3.1 文档解析层
+
+职责：
+
+- 扫描 `data/public_dataset_upload/raw/insurance/*.pdf`。
+- 为每个 `doc_id` 生成页级文本缓存。
+- 尝试恢复保险条款章节结构，生成带页码映射的 Markdown。
+- 记录解析质量，例如页数、字符数、标题命中数、目录恢复方式、失败原因。
+
+产物：
+
+- `data/processed_data/pages/{doc_id}.jsonl`
+- `data/processed_data/markdown/insurance/{doc_id}.md`
+- `data/processed_data/markdown/insurance/{doc_id}.page_map.json`
+- `data/processed_data/quality/insurance_parse_quality.jsonl`
+
+### 3.2 PageIndex 结构索引层
+
+职责：
+
+- 使用 `open_projects/PageIndex/pageindex/page_index_md.py` 的 Markdown 树能力生成主索引。
+- 使用 `open_projects/PageIndex/pageindex/page_index.py` 的 PDF 树能力生成兜底索引。
+- 为每个索引文件保留 `doc_id`、源文件路径、索引路线、树结构和页码映射信息。
+- 输出统一格式，屏蔽 PDF 路线与 Markdown 路线的结构差异。
+
+产物：
+
+- `data/processed_data/pageindex/insurance/{doc_id}.json`
+- `data/processed_data/pageindex/insurance/{doc_id}.pdf_fallback.json`
+- `data/processed_data/quality/insurance_index_quality.jsonl`
+
+### 3.3 保险题检索层
+
+职责：
+
+- 读取 A 榜题目中的 `doc_ids`。
+- 按题干和选项生成保险领域查询信号。
+- 在每个指定文档的 PageIndex 树中选择少量候选节点。
+- 将候选节点转换为页码窗口，读取紧凑原文页段。
+
+当前 A 榜不启用候选文档召回。`DocRetriever` 接口保留为空实现或 passthrough 实现：输入题目，输出题目内的 `doc_ids`。
+
+### 3.4 证据记忆层
+
+职责：
+
+- 按选项抽取证据，而不是只按题目抽取证据。
+- 将页段原文压缩为可审计的结构化证据记忆。
+- 去重同一 `doc_id + pages + quote` 的重复证据。
+- 保留支持、反驳、不确定三类证据，避免过早丢弃冲突信息。
+
+证据记忆必须保留原文短引文、页码、节点和归一化事实。压缩只压缩解释，不删除定位信息和数字字段。
+
+### 3.5 答案推理层
+
+职责：
+
+- 基于证据记忆逐项判断 A/B/C/D。
+- 对金额、比例、排序题调用程序化计算模块，不依赖模型口算。
+- 对单选、多选、判断题做答案合法化。
+- 在证据不足、答案为空、选项冲突时触发一次补检索或自检。
+
+### 3.6 输出与审计层
+
+职责：
+
+- 导出 `answer.csv`。
+- 导出 `evidence.jsonl`。
+- 记录模型调用日志、Token usage、阶段耗时和异常信息。
+- 输出可复现运行摘要，便于赛后代码审核。
+
+## 4. 双路线索引设计
+
+### 4.1 Markdown 优先路线
+
+Markdown 路线是默认主路：
+
+```text
+PDF -> 页级文本/OCR/版面恢复 -> 带标题层级的 Markdown -> PageIndex Markdown tree -> node_id -> line_num -> source_page
+```
+
+适用原因：
+
+- 保险条款常有“第几章”“第几条”“保险责任”“责任免除”“释义”等稳定标题。
+- 当前 insurance 统计显示多数 PDF 内置目录不可用，直接依赖 PDF outline 风险高。
+- Markdown 标题层级可控，便于修正条款编号、跨页标题和表格标题。
+- 不生成摘要时，Markdown 树构建成本更可控。
+
+关键要求：
+
+- Markdown 标题必须能映射回 PDF 页码。
+- `line_num` 不能直接当作页码使用，必须通过 `page_map` 转换。
+- Markdown 路线的索引文件应额外保存 `node_id -> source_page_range`。
+
+### 4.2 PDF 直连兜底路线
+
+PDF 路线作为快速验证和兜底：
+
+```text
+PDF -> PageIndex PDF tree -> node_id -> start_index/end_index -> PDF page text
+```
+
+适用场景：
+
+- Markdown 解析失败。
+- Markdown 标题恢复质量过低。
+- PDF 文本抽取已足够稳定，且 PageIndex 能生成合理章节树。
+- 需要快速构建最小可用基线。
+
+限制：
+
+- 无目录保险条款可能生成较粗的节点。
+- `start_index/end_index` 可能受页码偏移和标题定位影响。
+- PDF 路线如在正式流程中调用 LLM 构树，应使用 Qwen 并记录构建日志；更推荐把索引构建放到题目无关的离线阶段。
+
+### 4.3 路线选择规则
+
+每个文档离线构建后做质量评分：
+
+| 指标 | 推荐判断 |
+| --- | --- |
+| 节点数 | 太少说明章节恢复不足，优先检查 Markdown 标题或 PDF 兜底。 |
+| 空标题数 | 非 0 时记录质量问题。 |
+| 页码范围 | `start > end` 或超出页数时判为坏节点。 |
+| 关键词覆盖 | “保险责任”“责任免除”“现金价值”“犹豫期”等标题命中越多越优先。 |
+| 页码映射完整度 | Markdown 节点缺少 `source_page_range` 时不得作为主索引。 |
+
+默认优先级：
+
+1. Markdown 主索引质量合格时使用 Markdown。
+2. Markdown 不合格但 PDF 索引合格时使用 PDF。
+3. 两者均不合格时降级为页级关键词检索，并把该文档标记为需人工检查或强化解析。
+
+## 5. 数据与配置入口
+
+### 5.1 固定配置
+
+| 配置项 | 值 |
+| --- | --- |
+| `domain` | `insurance` |
+| `split` | `A` |
+| `raw_dir` | `data/public_dataset_upload/raw/insurance` |
+| `questions` | `data/public_dataset_upload/questions/group_a/insurance_questions.json` |
+| `pageindex_root` | `open_projects/PageIndex` |
+| `output_dir` | `outputs/insurance_a` |
+
+### 5.2 目录布局
+
+```text
+data/processed_data/
+├── pages/
+│   └── {doc_id}.jsonl
+├── markdown/
+│   └── insurance/
+│       ├── {doc_id}.md
+│       └── {doc_id}.page_map.json
+├── pageindex/
+│   └── insurance/
+│       ├── {doc_id}.json
+│       └── {doc_id}.pdf_fallback.json
+├── catalog/
+│   └── doc_catalog.jsonl
+└── quality/
+    ├── insurance_parse_quality.jsonl
+    └── insurance_index_quality.jsonl
+
+outputs/
+└── insurance_a/
+    ├── answer.csv
+    ├── evidence.jsonl
+    └── logs/
+```
+
+`doc_catalog.jsonl` 在当前 A 榜中不是主流程输入，但应在离线阶段顺手生成，作为 B 榜扩展入口。
+
+## 6. Agent 模块边界
+
+### 6.1 `QuestionParser`
+
+输入：题目 JSON。
+
+输出：
+
+- `qid`
+- `question`
+- `options`
+- `answer_format`
+- `type`
+- `domain`
+- `doc_ids`
+- 题干关键词、选项关键词、数字条件、产品名候选
+
+保险题应特别识别：
+
+- 产品名：平安智盈金生、国寿增益宝、国寿鑫享添盈、平安富鸿金生等。
+- 责任类别：身故、退保、医疗费用、等待期、免赔额、保单贷款等。
+- 计算条件：已交保费、现金价值、账户价值、免赔额、报销金额、给付比例。
+
+### 6.2 `DocRetriever`
+
+当前 A 榜行为：
+
+- 直接返回题目内 `doc_ids`。
+- 不做跨文档召回、不做重排。
+
+预留 B 榜行为：
+
+- 按 `domain` 过滤 `doc_catalog`。
+- 基于产品名、公司名、法规名、年份、标题关键词做候选召回。
+- 使用 Qwen 对紧凑 catalog 做候选文档选择。
+
+### 6.3 `InsuranceDocStore`
+
+职责：
+
+- 根据 `doc_id` 读取主索引。
+- 在主索引不可用时读取 PDF 兜底索引。
+- 提供扁平节点列表、节点详情、节点到页码范围、页码范围到页文本的统一接口。
+- 屏蔽 Markdown 的 `line_num` 和 PDF 的 `start_index/end_index` 差异。
+
+统一输出应使用页码范围，不把行号暴露给后续问答模块。
+
+### 6.4 `TreeRetriever`
+
+职责：
+
+- 根据题目、选项和保险关键词，从 PageIndex 树中选择候选节点。
+- 小树可直接让 Qwen 看紧凑树结构。
+- 大树先做规则预筛，再让 Qwen 从候选节点中选择。
+
+节点选择不得直接回答题目，只返回候选 `node_id`、标题、页码范围和选择理由。
+
+### 6.5 `EvidenceExtractor`
+
+职责：
+
+- 对每个选项分别读取相关页段。
+- 只基于页段原文判断证据是支持、反驳还是不确定。
+- 输出结构化证据记忆。
+
+证据字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `qid` | 题目 ID |
+| `doc_id` | 文档 ID |
+| `node_id` | PageIndex 节点 ID，页级降级检索时可为空 |
+| `pages` | PDF 页码范围 |
+| `option` | A/B/C/D |
+| `evidence_type` | `support`、`refute`、`unclear` |
+| `quote` | 来自原文的短引文 |
+| `normalized_fact` | 面向题目的归一化事实 |
+| `numbers` | 抽取出的金额、比例、期限、免赔额等 |
+| `confidence` | `high`、`medium`、`low` |
+
+### 6.6 `CalculationEngine`
+
+职责：
+
+- 统一处理保险金额、比例、排序和扣减。
+- 对题目中的万元、元、百分比、保单年度等单位做归一化。
+- 将计算过程和结果写回证据记忆或答案判断上下文。
+
+优先覆盖的计算类型：
+
+- 身故保险金比较。
+- 退保所得。
+- 医疗费用扣除医保、免赔额后的赔付额。
+- 多产品赔付排序。
+- 给付比例和最高限额判断。
+
+### 6.7 `AnswerJudge`
+
+职责：
+
+- 只基于证据记忆和程序计算结果逐项判断。
+- 单选题输出唯一字母。
+- 多选题输出去重、排序后的字母串。
+- 判断题按题目选项含义输出 A 或 B。
+- 对非法答案做程序化修正，不能把模型原始输出直接写入 `answer.csv`。
+
+## 7. A榜 Insurance 端到端流程
+
+### 7.1 离线预处理
+
+1. 扫描 16 个保险 PDF。
+2. 抽取每页文本，保存页级缓存。
+3. 生成保险条款 Markdown 和页码映射。
+4. 构建 Markdown PageIndex 主索引。
+5. 构建 PDF PageIndex 兜底索引。
+6. 运行索引质量检查。
+7. 生成 `doc_catalog.jsonl`，为后续 B 榜预留。
+
+### 7.2 在线答题
+
+1. 读取 `insurance_questions.json`。
+2. `QuestionParser` 解析题目、选项、类型和 `doc_ids`。
+3. `DocRetriever` 直接返回 A 榜 `doc_ids`。
+4. 对每个 `doc_id`，`InsuranceDocStore` 读取 PageIndex 树。
+5. `TreeRetriever` 选择相关节点。
+6. 将节点转换为页码窗口，读取页级原文。
+7. `EvidenceExtractor` 按选项生成证据记忆。
+8. `CalculationEngine` 处理金额、比例和排序。
+9. `AnswerJudge` 输出合法答案。
+10. 写入 `answer.csv`、`evidence.jsonl` 和日志。
+
+## 8. 保险领域检索策略
+
+### 8.1 领域关键词
+
+保险条款检索的高优先级关键词：
+
+- 保险责任
+- 责任免除
+- 身故保险金
+- 现金价值
+- 账户价值
+- 退保
+- 犹豫期
+- 等待期
+- 宽限期
+- 保单贷款
+- 免赔额
+- 给付比例
+- 保险金申请
+- 受益人
+- 保险期间
+- 释义
+
+### 8.2 选项级检索
+
+保险题经常是多产品比较或多选判断。系统不应只根据题干检索一次，而应把每个选项作为独立检索目标：
+
+- 单个选项涉及一个产品时，优先检索该产品文档内的对应条款。
+- 单个选项涉及多个产品时，拆成多个产品事实，再合并判断。
+- 选项包含括号解释时，括号内容也参与关键词提取。
+- 选项包含数值时，保留数值作为页内匹配和计算输入。
+
+### 8.3 多产品比较
+
+多产品题按“产品-字段”矩阵组织证据：
+
+| 产品 | 字段 | 证据 | 计算值 | 判断 |
+| --- | --- | --- | --- | --- |
+| 产品 A | 身故保险金 | 原文页段 | 金额 | 支持/反驳 |
+| 产品 B | 退保金额 | 原文页段 | 金额 | 支持/反驳 |
+
+最终判断时先完成每个产品的事实抽取，再比较选项中的排序或条件，不让模型在缺少中间事实时直接猜答案。
+
+## 9. 页段窗口与回退策略
+
+默认窗口：
+
+- 节点范围为 1 到 2 页：前后各扩展 1 页。
+- 节点范围为 3 到 8 页：读取完整节点页段。
+- 节点范围超过 8 页：先在节点范围内做页级关键词命中，再读取命中页和邻页。
+- 表格或公式题：优先扩展后一页，防止表头和表体跨页。
+
+回退顺序：
+
+1. 扩大同节点页码窗口。
+2. 增加同文档相邻节点。
+3. 使用保险领域关键词重新做树检索。
+4. 降级为页级关键词检索。
+5. 仍无证据时标记该选项为 `unclear`，交给最终判断器处理。
+
+每题最多触发一次补检索，避免 Token 成本失控。
+
+## 10. 模型与 Token 策略
+
+正式推理问答阶段包括：
+
+- 树节点选择。
+- 页段证据抽取。
+- 证据压缩。
+- 选项判断。
+- 答案自检。
+
+这些阶段应使用 Qwen 系列模型，并通过统一模型客户端记录：
+
+- `qid`
+- `stage`
+- `model`
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `latency_ms`
+- `success`
+- `error`
+
+`docs/模型配置.md` 中的 `ark-code-latest` 和 `ARK_API_KEY` 可用于开发调试、接口验证或本地实验，但正式赛题推理模型应以赛题要求的 Qwen 系列模型为准。架构中不得把 ARK 调试模型写成正式评测默认模型。
+
+PageIndex 离线索引构建如调用 LLM，应单独记录构建日志。正式答题的 Token 统计重点覆盖围绕题目的检索、压缩、判断、生成和自检调用。
+
+## 11. 输出格式
+
+### 11.1 `answer.csv`
+
+字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `qid` | 题目 ID，汇总行使用 `summary` |
+| `answer` | 合法答案字母 |
+| `prompt_tokens` | 该题输入 Token |
+| `completion_tokens` | 该题输出 Token |
+| `total_tokens` | 两者之和 |
+
+多选题答案必须去重、排序，不使用空格、逗号或其他分隔符。
+
+### 11.2 `evidence.jsonl`
+
+每题一行，建议包含：
+
+- `qid`
+- `answer`
+- `candidate_docs`
+- `selected_nodes`
+- `evidence`
+- `calculations`
+- `usage`
+- `fallbacks`
+- `warnings`
+
+`evidence` 内每条证据必须能追溯到 `doc_id + node_id/pages + quote`。
+
+### 11.3 日志
+
+日志保存到 `outputs/insurance_a/logs/`。
+
+日志不得保存 API Key，不得引入标准答案或外部答案信息。
+
+## 12. 扩展设计
+
+### 12.1 扩展到 B 榜
+
+B 榜缺少 `doc_ids`，扩展时只替换 `DocRetriever`：
+
+- 当前 A 榜：`DocRetriever(question) -> question.doc_ids`
+- B 榜：`DocRetriever(question, doc_catalog) -> candidate_doc_ids`
+
+其余模块继续复用：
+
+- `InsuranceDocStore`
+- `TreeRetriever`
+- `EvidenceExtractor`
+- `CalculationEngine`
+- `AnswerJudge`
+
+B 榜候选文档召回应基于 `domain`、元数据、标题、章节标题、关键词和 Qwen 候选选择，不使用非 Qwen 模型生成的向量、重排或语义摘要参与正式答题。
+
+### 12.2 扩展到其他领域
+
+可复用模块：
+
+- 文档解析层。
+- PageIndex 结构索引层。
+- 通用 `DocStore`。
+- 通用树检索。
+- 证据记忆结构。
+- 答案合法化。
+- Token 统计和输出审计。
+
+领域专属模块：
+
+| 领域 | 需要替换或增强的部分 |
+| --- | --- |
+| `regulatory` | 法条编号、义务主体、期限、处罚、适用范围识别。 |
+| `financial_contracts` | 债券发行条款、评级、担保、募集资金用途识别。 |
+| `financial_reports` | 财务指标、年份、公司主体、表格和同口径计算。 |
+| `research` | 研报标题、图表标题、预测指标、观点核验。 |
+| `insurance` | 产品条款、责任触发、免责、赔付公式、免赔额和现金价值。 |
+
+领域扩展应新增 `DomainAdapter`，而不是改动 PageIndex 封装和输出审计层。
+
+## 13. 验收标准
+
+### 13.1 数据完整性
+
+- 16 个 insurance PDF 均生成页级文本缓存。
+- 每个文档至少生成一种 PageIndex 索引。
+- 质量报告能标记 Markdown 主路、PDF 兜底或页级降级状态。
+
+### 13.2 A 榜链路
+
+- 20 道 `ins_a_*` 题能完整走通。
+- 每题直接使用题目 `doc_ids`。
+- 不启用 B 榜候选召回。
+
+### 13.3 证据可追溯
+
+- 每个最终答案至少有一条证据可追溯到 `doc_id + node_id/pages + quote`。
+- 多选题每个被判为正确的选项都应有支持证据。
+- 被判为错误的高风险选项应尽量保留反驳证据。
+
+### 13.4 答案格式
+
+- `mcq` 输出一个大写字母。
+- `multi` 输出排序后的大写字母串。
+- `tf` 输出 A 或 B。
+- 无非法字符、空格、逗号或重复字母。
+
+### 13.5 回退策略
+
+- Markdown 失败时能切换 PDF 兜底。
+- 节点定位不足时能扩大页窗口。
+- 证据不足时能触发一次补检索。
+- 回退动作写入 `evidence.jsonl` 或日志。
+
+### 13.6 扩展性
+
+- 文档中明确 A 榜 `DocRetriever` 是 passthrough。
+- B 榜候选召回作为扩展接口存在，但不是当前主流程。
+- insurance 专属逻辑集中在 `DomainAdapter`、关键词策略和计算规则中。
+- PageIndex 封装、证据记忆、输出审计可以被其他领域复用。
+
+## 14. 实施优先级
+
+第一阶段建立可跑通的 A 榜保险基线：
+
+1. 页级缓存。
+2. Markdown 主索引和 PDF 兜底索引。
+3. A 榜题目解析和 `doc_ids` passthrough。
+4. 树节点选择。
+5. 页段证据抽取。
+6. 程序化答案规范化。
+7. `answer.csv` 与 `evidence.jsonl` 输出。
+
+第二阶段提升准确率：
+
+1. 保险领域关键词和产品名词典。
+2. 选项级补检索。
+3. 身故保险金、退保金额、医疗赔付等计算模块。
+4. 冲突证据保留和自检。
+
+第三阶段控制成本和扩展：
+
+1. 缓存树检索和证据抽取结果。
+2. 限制每题页数、节点数、证据数。
+3. 接入 `doc_catalog` 和 B 榜候选召回。
+4. 抽象其他领域 `DomainAdapter`。
+
+## 15. 关键结论
+
+当前 A 榜 insurance 系统应采用确定性流水线，而不是让 Agent 自由浏览全文。PageIndex 的职责是提供结构化章节树和可追溯节点定位；项目侧围绕题目和选项完成保险领域检索、证据记忆、程序计算和答案约束。
+
+双路线索引是本设计的核心：Markdown 优先保证保险条款结构和页码映射质量，PDF 直连 PageIndex 作为快速验证和兜底。这样既能服务当前 20 道 A 榜保险题，也能在后续扩展到 B 榜和其他金融文档领域时保持模块边界稳定。
