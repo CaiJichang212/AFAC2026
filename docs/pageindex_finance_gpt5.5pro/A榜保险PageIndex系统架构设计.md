@@ -23,6 +23,7 @@
 | PageIndex 是第三方源码 | 只通过薄封装调用，不修改 `open_projects/PageIndex`。 |
 | 正式推理问答阶段模型限制 | 文档定位、证据判断、答案生成、自检等正式推理调用使用 Qwen 系列并统计 Token。 |
 | `docs/模型配置.md` 中存在 ARK 配置 | ARK 兼容 OpenAI 协议配置仅作为开发调试配置，不作为正式赛题推理模型假设。 |
+| PageIndex 默认配置不是赛题配置 | 不使用默认 `config.yaml` 和 `PageIndexClient.index()` 作为正式索引入口，项目侧必须显式传入模型与开关参数。 |
 
 ## 3. 总体架构
 
@@ -63,10 +64,18 @@
 - 为每个索引文件保留 `doc_id`、源文件路径、索引路线、树结构和页码映射信息。
 - 输出统一格式，屏蔽 PDF 路线与 Markdown 路线的结构差异。
 
+调用边界：
+
+- 禁止在正式流程中直接使用 `PageIndexClient.index()`，因为该高层入口会硬编码开启节点摘要、文档描述和节点正文，且会生成随机 workspace 文档 ID，不符合赛题 `doc_id` 追踪要求。
+- Markdown 主路必须由项目侧薄封装直接调用 `md_to_tree()`，并显式设置 `if_add_node_summary="no"`、`if_add_doc_description="no"`、`if_add_node_text="no"`、`if_add_node_id="yes"`。
+- PDF 兜底路必须由项目侧薄封装直接调用 `page_index()`，并显式设置 `if_add_node_summary="no"`、`if_add_doc_description="no"`、`if_add_node_text="no"`、`if_add_node_id="yes"`，正式提交产物必须传入赛题允许的 Qwen 模型。
+- 不依赖 `open_projects/PageIndex/pageindex/config.yaml` 默认值；该文件中的默认模型和摘要开关只视为 PageIndex 项目自身示例配置。
+
 产物：
 
 - `data/processed_data/pageindex/insurance/{doc_id}.json`
 - `data/processed_data/pageindex/insurance/{doc_id}.pdf_fallback.json`
+- `data/processed_data/pageindex/insurance/{doc_id}.node_spans.json`
 - `data/processed_data/quality/insurance_index_quality.jsonl`
 
 ### 3.3 保险题检索层
@@ -131,6 +140,23 @@ PDF -> 页级文本/OCR/版面恢复 -> 带标题层级的 Markdown -> PageIndex
 - Markdown 标题必须能映射回 PDF 页码。
 - `line_num` 不能直接当作页码使用，必须通过 `page_map` 转换。
 - Markdown 路线的索引文件应额外保存 `node_id -> source_page_range`。
+- 不直接使用 PageIndex `retrieve.py` 的 Markdown `get_page_content()` 作为正式页读取工具；该函数把 `pages` 解释为 Markdown 行号，不是 PDF 物理页码。
+- 正式答题统一从项目侧 `data/processed_data/pages/{doc_id}.jsonl` 读取 PDF 页文本。
+
+Markdown 主路必须生成节点跨度文件 `node_spans`。字段约定：
+
+| 字段 | 说明 |
+| --- | --- |
+| `doc_id` | 赛题文档 ID，例如 `1`、`16` |
+| `node_id` | PageIndex 节点 ID |
+| `title` | 节点标题 |
+| `start_line` | 节点标题所在 Markdown 行 |
+| `end_line` | 下一个同级或更高层级标题前一行；末节点为文档末行 |
+| `start_page` | `start_line` 映射到的 PDF 页 |
+| `end_page` | `end_line` 映射到的 PDF 页 |
+| `source_page_range` | 面向后续模块的页码范围字符串，例如 `4-6` |
+
+`InsuranceDocStore` 只能向后续模块暴露 `source_page_range`，不能让后续问答模块直接消费 `line_num`。
 
 ### 4.2 PDF 直连兜底路线
 
@@ -152,6 +178,7 @@ PDF -> PageIndex PDF tree -> node_id -> start_index/end_index -> PDF page text
 - 无目录保险条款可能生成较粗的节点。
 - `start_index/end_index` 可能受页码偏移和标题定位影响。
 - PDF 路线如在正式流程中调用 LLM 构树，应使用 Qwen 并记录构建日志；更推荐把索引构建放到题目无关的离线阶段。
+- PDF 路线即使关闭摘要，也可能调用 LLM 进行目录检测、目录转换、无目录树生成和页码校验，不能把它视为零成本兜底。
 
 ### 4.3 路线选择规则
 
@@ -170,6 +197,8 @@ PDF -> PageIndex PDF tree -> node_id -> start_index/end_index -> PDF page text
 1. Markdown 主索引质量合格时使用 Markdown。
 2. Markdown 不合格但 PDF 索引合格时使用 PDF。
 3. 两者均不合格时降级为页级关键词检索，并把该文档标记为需人工检查或强化解析。
+
+PDF 兜底索引默认采用按质量触发策略：先构建 Markdown 主索引并运行质量检查，仅对 Markdown 缺少有效页码映射、关键标题覆盖不足或坏节点过多的文档构建 PDF 兜底。若为了实验选择 16 个 PDF 全量构建兜底索引，必须单独写入索引构建日志，并明确该成本不混入每题正式答题 Token。
 
 ## 5. 数据与配置入口
 
@@ -197,7 +226,8 @@ data/processed_data/
 ├── pageindex/
 │   └── insurance/
 │       ├── {doc_id}.json
-│       └── {doc_id}.pdf_fallback.json
+│       ├── {doc_id}.pdf_fallback.json
+│       └── {doc_id}.node_spans.json
 ├── catalog/
 │   └── doc_catalog.jsonl
 └── quality/
@@ -211,7 +241,20 @@ outputs/
     └── logs/
 ```
 
-`doc_catalog.jsonl` 在当前 A 榜中不是主流程输入，但应在离线阶段顺手生成，作为 B 榜扩展入口。
+`doc_catalog.jsonl` 是 A 榜也必须使用的元数据输入。A 榜虽然不需要候选文档召回，但题目和选项使用产品名、险种简称和别名表达，题目字段只给数字 `doc_ids`；没有 catalog，选项级检索容易把产品和文档对应关系搞错。
+
+保险 catalog 每行至少包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `doc_id` | 数字文档 ID，与 PDF 文件名一致 |
+| `product_name` | 条款主产品名 |
+| `aliases` | 题干、选项中可能出现的简称或别名 |
+| `insurer` | 保险公司或承保主体 |
+| `insurance_type` | 年金险、医疗险、重疾险、责任险、家财险、车险等 |
+| `source_pdf` | 原始 PDF 相对路径 |
+| `top_titles` | 一级/二级章节标题，来自解析或 PageIndex 树 |
+| `primary_index_route` | `markdown`、`pdf_fallback` 或 `page_keyword` |
 
 ## 6. Agent 模块边界
 
@@ -232,9 +275,11 @@ outputs/
 
 保险题应特别识别：
 
-- 产品名：平安智盈金生、国寿增益宝、国寿鑫享添盈、平安富鸿金生等。
+- 产品名和别名：平安智盈金生、国寿增益宝、国寿鑫享添盈、平安富鸿金生、众安白血病医疗险、平安 e 生保、太保团体百万医疗、平安安佑福重疾险、平安预防接种意外险、众安食责险、众安营运交通意外险、平安特种车险、众安特种车险、平安家财险、众安家财险等。
 - 责任类别：身故、退保、医疗费用、等待期、免赔额、保单贷款等。
 - 计算条件：已交保费、现金价值、账户价值、免赔额、报销金额、给付比例。
+
+`QuestionParser` 必须结合 `doc_catalog.jsonl` 输出 `mentioned_products` 和 `doc_product_map`，把题目中的产品名、简称、别名映射到题目给定的 `doc_ids`。
 
 ### 6.2 `DocRetriever`
 
@@ -242,6 +287,7 @@ outputs/
 
 - 直接返回题目内 `doc_ids`。
 - 不做跨文档召回、不做重排。
+- 用 `doc_catalog.jsonl` 校验题目涉及的产品名是否能映射到这些 `doc_ids`；无法映射时写入 warning，但不得自行引入题目外文档。
 
 预留 B 榜行为：
 
@@ -259,6 +305,18 @@ outputs/
 - 屏蔽 Markdown 的 `line_num` 和 PDF 的 `start_index/end_index` 差异。
 
 统一输出应使用页码范围，不把行号暴露给后续问答模块。
+
+Markdown 主索引读取规则：
+
+- 从 `{doc_id}.json` 读取 PageIndex 树。
+- 从 `{doc_id}.node_spans.json` 读取 `node_id -> source_page_range`。
+- 从 `data/processed_data/pages/{doc_id}.jsonl` 读取 PDF 页文本。
+
+PDF 兜底索引读取规则：
+
+- 从 `{doc_id}.pdf_fallback.json` 读取 PageIndex 树。
+- 使用节点 `start_index/end_index` 生成页码范围。
+- 页文本仍优先读取 `data/processed_data/pages/{doc_id}.jsonl`，只在缓存缺失时才回读原始 PDF。
 
 ### 6.4 `TreeRetriever`
 
@@ -292,6 +350,8 @@ outputs/
 | `normalized_fact` | 面向题目的归一化事实 |
 | `numbers` | 抽取出的金额、比例、期限、免赔额等 |
 | `confidence` | `high`、`medium`、`low` |
+
+每个选项都必须形成 verdict 记录，取值为 `support`、`refute` 或 `unclear`。被最终选中的选项必须有 `support` 证据；未选中的高风险选项应有 `refute` 证据，或记录补检索后仍为 `unclear` 的原因。
 
 ### 6.6 `CalculationEngine`
 
@@ -327,14 +387,15 @@ outputs/
 2. 抽取每页文本，保存页级缓存。
 3. 生成保险条款 Markdown 和页码映射。
 4. 构建 Markdown PageIndex 主索引。
-5. 构建 PDF PageIndex 兜底索引。
-6. 运行索引质量检查。
-7. 生成 `doc_catalog.jsonl`，为后续 B 榜预留。
+5. 生成 `node_spans`，把 Markdown 节点映射到 PDF 页码范围。
+6. 运行 Markdown 主索引质量检查。
+7. 仅对主索引不合格的文档构建 PDF PageIndex 兜底索引；实验性全量兜底构建必须单独标记。
+8. 生成 A 榜必需的 `doc_catalog.jsonl`，同时为后续 B 榜预留。
 
 ### 7.2 在线答题
 
 1. 读取 `insurance_questions.json`。
-2. `QuestionParser` 解析题目、选项、类型和 `doc_ids`。
+2. `QuestionParser` 结合 `doc_catalog.jsonl` 解析题目、选项、类型、产品别名和 `doc_ids`。
 3. `DocRetriever` 直接返回 A 榜 `doc_ids`。
 4. 对每个 `doc_id`，`InsuranceDocStore` 读取 PageIndex 树。
 5. `TreeRetriever` 选择相关节点。
@@ -389,6 +450,27 @@ outputs/
 
 ## 9. 页段窗口与回退策略
 
+### 9.1 硬性预算
+
+默认预算参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MAX_DOCS_PER_QUESTION` | 4 | A 榜以题目 `doc_ids` 为准，超过时按题目顺序截断并记录 warning |
+| `MAX_NODES_PER_DOC` | 5 | 每个文档进入页读取的候选节点上限 |
+| `MAX_PAGES_PER_DOC` | 8 | 每个文档读取的页数上限 |
+| `MAX_EVIDENCE_PER_OPTION` | 3 | 每个选项保留的证据上限 |
+| `MAX_RETRY_PER_QUESTION` | 1 | 每题补检索或自检次数上限 |
+
+裁剪顺序：
+
+1. 优先保留标题命中产品名、责任类别、金额/比例关键词的节点。
+2. 优先保留页码范围更短的节点。
+3. 多产品题按产品均衡保留节点，避免一个产品占满预算。
+4. 已有 `support/refute` 高置信证据的选项不再继续扩展页段。
+
+### 9.2 页段窗口
+
 默认窗口：
 
 - 节点范围为 1 到 2 页：前后各扩展 1 页。
@@ -416,7 +498,7 @@ outputs/
 - 选项判断。
 - 答案自检。
 
-这些阶段应使用 Qwen 系列模型，并通过统一模型客户端记录：
+这些阶段应使用 Qwen 系列模型，正式评测默认参考赛题基准模型 `Qwen3.6-plus`。所有调用通过统一模型客户端记录：
 
 - `qid`
 - `stage`
@@ -430,7 +512,21 @@ outputs/
 
 `docs/模型配置.md` 中的 `ark-code-latest` 和 `ARK_API_KEY` 可用于开发调试、接口验证或本地实验，但正式赛题推理模型应以赛题要求的 Qwen 系列模型为准。架构中不得把 ARK 调试模型写成正式评测默认模型。
 
-PageIndex 离线索引构建如调用 LLM，应单独记录构建日志。正式答题的 Token 统计重点覆盖围绕题目的检索、压缩、判断、生成和自检调用。
+PageIndex 离线索引构建如调用 LLM，应单独记录构建日志。若索引构建在题目无关的离线预处理阶段完成，则不混入每题答题 Token；若构建或修复索引发生在正式答题阶段，则必须使用 Qwen 并纳入该题 Token 统计。
+
+PageIndex 调用参数必须在项目侧配置中显式落盘，禁止隐式读取 PageIndex 默认 `config.yaml`。正式索引构建推荐参数：
+
+| 参数 | Markdown 主路 | PDF 兜底路 |
+| --- | --- | --- |
+| `model` | 正式 Qwen 模型 | 正式 Qwen 模型 |
+| `if_add_node_id` | `yes` | `yes` |
+| `if_add_node_summary` | `no` | `no` |
+| `if_add_doc_description` | `no` | `no` |
+| `if_add_node_text` | `no` | `no` |
+| `toc_check_page_num` | 不适用 | 显式配置，默认 20 |
+| `max_page_num_each_node` | 不适用 | 显式配置，建议 6 到 10 |
+
+开发阶段可以用非正式模型做本地实验，但其生成的 PageIndex 结构、摘要、选择结果或纠错结果不得进入正式提交链路；正式提交所用索引若包含 LLM 生成的结构信息，应使用赛题允许的 Qwen 模型构建并保留日志。
 
 ## 11. 输出格式
 
@@ -463,6 +559,8 @@ PageIndex 离线索引构建如调用 LLM，应单独记录构建日志。正式
 - `warnings`
 
 `evidence` 内每条证据必须能追溯到 `doc_id + node_id/pages + quote`。
+
+`evidence.jsonl` 还应包含 `option_judgements`，记录每个选项的 verdict、证据 ID、计算 ID 和补检索状态。计算/排序题的 `calculations` 必须保留每个产品字段的中间事实、归一化数值、单位和最终比较结果。
 
 ### 11.3 日志
 
@@ -518,20 +616,25 @@ B 榜候选文档召回应基于 `domain`、元数据、标题、章节标题、
 ### 13.1 数据完整性
 
 - 16 个 insurance PDF 均生成页级文本缓存。
-- 每个文档至少生成一种 PageIndex 索引。
+- 每个文档均尝试生成 Markdown 主索引；无法生成或质量不合格时必须记录原因，并生成 PDF 兜底索引或页级降级标记。
+- 每个 Markdown 主索引都有对应 `node_spans`，且所有可用节点能映射到 PDF 页码范围。
+- `doc_catalog.jsonl` 覆盖 16 个 `doc_id`，并能映射 A 榜题目中出现的产品名和别名。
 - 质量报告能标记 Markdown 主路、PDF 兜底或页级降级状态。
+- 质量报告至少包含节点数、空标题数、坏页码范围数、关键词标题命中数、页码映射覆盖率。
 
 ### 13.2 A 榜链路
 
 - 20 道 `ins_a_*` 题能完整走通。
 - 每题直接使用题目 `doc_ids`。
 - 不启用 B 榜候选召回。
+- 题目中全部 `doc_ids` 都能在 `doc_catalog.jsonl` 中找到产品元数据。
 
 ### 13.3 证据可追溯
 
-- 每个最终答案至少有一条证据可追溯到 `doc_id + node_id/pages + quote`。
-- 多选题每个被判为正确的选项都应有支持证据。
-- 被判为错误的高风险选项应尽量保留反驳证据。
+- 每个选项都有 `support/refute/unclear` verdict 记录。
+- 每个被最终选中的选项都必须有支持证据，且证据可追溯到 `doc_id + node_id/pages + quote`。
+- 未选中的高风险选项应保留反驳证据；若补检索后仍无法判断，必须记录 `unclear` 原因。
+- 计算题和排序题必须保留每个产品字段的中间事实、归一化数值、单位和计算结果。
 
 ### 13.4 答案格式
 
@@ -546,6 +649,7 @@ B 榜候选文档召回应基于 `domain`、元数据、标题、章节标题、
 - 节点定位不足时能扩大页窗口。
 - 证据不足时能触发一次补检索。
 - 回退动作写入 `evidence.jsonl` 或日志。
+- PDF 兜底索引按质量触发；若全量构建，索引日志必须标记为实验性全量兜底。
 
 ### 13.6 扩展性
 
@@ -559,12 +663,14 @@ B 榜候选文档召回应基于 `domain`、元数据、标题、章节标题、
 第一阶段建立可跑通的 A 榜保险基线：
 
 1. 页级缓存。
-2. Markdown 主索引和 PDF 兜底索引。
-3. A 榜题目解析和 `doc_ids` passthrough。
-4. 树节点选择。
-5. 页段证据抽取。
-6. 程序化答案规范化。
-7. `answer.csv` 与 `evidence.jsonl` 输出。
+2. A 榜必需 `doc_catalog.jsonl`。
+3. Markdown 主索引和 `node_spans`。
+4. 按质量触发 PDF 兜底索引。
+5. A 榜题目解析、产品别名映射和 `doc_ids` passthrough。
+6. 树节点选择。
+7. 页段证据抽取。
+8. 程序化答案规范化。
+9. `answer.csv` 与 `evidence.jsonl` 输出。
 
 第二阶段提升准确率：
 
