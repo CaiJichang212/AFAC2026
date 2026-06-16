@@ -8,6 +8,7 @@ dependencies = [
     "litellm",
     "pyyaml",
     "python-dotenv",
+    "PyPDF2",
 ]
 
 [project.optional-dependencies]
