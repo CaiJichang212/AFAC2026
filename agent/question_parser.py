@@ -124,11 +124,19 @@ class QuestionParser:
         # so each record carries a 'source' tag (stem vs option_<LETTER>).
         number_conditions: list[dict[str, Any]] = []
         number_conditions.extend(
-            self._extract_number_conditions(question, source="stem")
+            self._extract_number_conditions(
+                question, source="stem",
+                mentioned_products=mentioned_products,
+                product_aliases=profile.product_aliases,
+            )
         )
         for letter, text in options.items():
             number_conditions.extend(
-                self._extract_number_conditions(text, source=f"option_{letter}")
+                self._extract_number_conditions(
+                    text, source=f"option_{letter}",
+                    mentioned_products=mentioned_products,
+                    product_aliases=profile.product_aliases,
+                )
             )
 
         return ParsedQuestion(
@@ -233,7 +241,9 @@ class QuestionParser:
     # ------------------------------------------------------------------
 
     def _extract_number_conditions(
-        self, text: str, source: str = "stem"
+        self, text: str, source: str = "stem",
+        mentioned_products: list[str] | None = None,
+        product_aliases: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Extract structured numeric conditions from *text*.
 
@@ -247,6 +257,7 @@ class QuestionParser:
             subject: str   — what the number refers to (e.g. "已交保费")
             snippet: str   — raw text around the match for inspection
             source: str    — origin of the text: "stem" or "option_<LETTER>"
+            product: str|None — canonical product name if one is found near the number
         """
         conditions: list[dict[str, Any]] = []
         seen: set[tuple[int, int]] = set()  # (start, end) spans already captured
@@ -277,6 +288,14 @@ class QuestionParser:
                 snippet_end = min(len(text), m.end() + 5)
                 snippet = text[snippet_start:snippet_end].strip()
 
+                # Best-effort product tagging: find the closest product name
+                product: str | None = None
+                if mentioned_products and product_aliases:
+                    product = self._find_nearest_product(
+                        text, m.start(), m.end(),
+                        mentioned_products, product_aliases,
+                    )
+
                 conditions.append(
                     {
                         "kind": kind,
@@ -285,6 +304,7 @@ class QuestionParser:
                         "subject": subject,
                         "snippet": snippet,
                         "source": source,
+                        "product": product,
                     }
                 )
 
@@ -339,6 +359,67 @@ class QuestionParser:
             return "age", ""
         else:
             return "amount", ""
+
+    @staticmethod
+    def _find_nearest_product(
+        text: str,
+        match_start: int,
+        match_end: int,
+        mentioned_products: list[str],
+        product_aliases: dict[str, str],
+    ) -> str | None:
+        """Find the canonical product name closest to a number match.
+
+        Searches a window of ±80 characters around the match for any product
+        alias or canonical name.  Returns the canonical name of the closest
+        match, or None if no product is found within the window.
+
+        In Chinese insurance text, product names almost always appear **before**
+        their associated values (e.g. "平安智盈金生保单账户价值90万元").
+        Therefore, product names found before the number are preferred:
+        if any alias appears before the number, the closest such alias wins.
+        Only when no alias appears before does the search fall back to names
+        after the number (which would belong to the *next* product).
+
+        This is best-effort: multiple products may appear near the same number
+        (e.g. in comparison sentences), and the closest one is returned.
+        """
+        window = 80
+        start = max(0, match_start - window)
+        end = min(len(text), match_end + window)
+        region = text[start:end]
+
+        best_before: tuple[int, str] | None = None   # (distance, canonical)
+        best_after: tuple[int, str] | None = None     # (distance, canonical)
+
+        for alias, canonical in product_aliases.items():
+            idx = 0
+            while True:
+                idx = region.find(alias, idx)
+                if idx < 0:
+                    break
+                alias_pos = start + idx
+                if alias_pos < match_start:
+                    # Alias is before the number
+                    dist = match_start - (alias_pos + len(alias))
+                    if best_before is None or dist < best_before[0]:
+                        best_before = (dist, canonical)
+                else:
+                    # Alias is after the number
+                    dist = alias_pos - match_end
+                    if best_after is None or dist < best_after[0]:
+                        best_after = (dist, canonical)
+                idx += max(len(alias), 1)
+
+        # Prefer the closest alias before the number
+        if best_before is not None and best_before[0] <= window:
+            return best_before[1]
+
+        # Fall back to the closest alias after the number
+        if best_after is not None and best_after[0] <= window:
+            return best_after[1]
+
+        return None
 
 
 def parse_questions(

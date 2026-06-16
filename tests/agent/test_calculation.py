@@ -1335,3 +1335,279 @@ class TestComputeFromFacts:
         pv = records[0].inputs["product_values"]
         assert pv["产品B"] == "100000"
         assert pv["产品A"] == "95000"
+
+
+# ===================================================================
+# Phase D: Per-product value resolution (regression test for stem-collision bug)
+# ===================================================================
+
+
+class TestPerProductResolution:
+    """Tests that field references resolve to the correct per-product value
+    when multiple products share the same field kind (collision bug fix)."""
+
+    def test_account_value_collision_resolves_per_product(self):
+        """Regression: 保单账户价值 collides between 智盈金生(90万) and 增益宝(85万).
+
+        The stem flattens both to kind='account_value' (last wins = 850000).
+        Without per-product resolution, 智盈金生 would wrongly use 850000.
+        With per-product VALUE facts, it correctly uses 900000.
+        """
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+
+        # Synthetic facts: per-product VALUE facts MUST be present for each
+        # product's field to avoid collision.  Also include RULE facts.
+        facts = [
+            # ---- 平安智盈金生: 身故保险金 = 保单账户价值 ----
+            FactRecord(
+                product="平安智盈金生", field="身故保险金",
+                formula_or_value="保单账户价值", unit="",
+                quote="身故保险金按保单账户价值给付",
+                source_doc_id="1", source_node_id="n1", source_pages="1-3",
+            ),
+            FactRecord(
+                product="平安智盈金生", field="保单账户价值",
+                formula_or_value="900000", unit="元",
+                quote="保单账户价值为90万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-3",
+            ),
+            # ---- 国寿增益宝: 身故保险金 = 基本保额 * 1.6 ----
+            FactRecord(
+                product="国寿增益宝", field="身故保险金",
+                formula_or_value="基本保额*1.6", unit="",
+                quote="按基本保额的160%给付身故保险金",
+                source_doc_id="2", source_node_id="n2", source_pages="4-6",
+            ),
+            FactRecord(
+                product="国寿增益宝", field="基本保额",
+                formula_or_value="900000", unit="元",
+                quote="基本保额90万元",
+                source_doc_id="2", source_node_id="n2", source_pages="4-6",
+            ),
+            # ---- 国寿鑫享添盈: 身故保险金 = 已交保费 - 已领养老年金 ----
+            FactRecord(
+                product="国寿鑫享添盈", field="身故保险金",
+                formula_or_value="已交保费-已领养老年金", unit="",
+                quote="已交保费扣除已领养老年金后的余额作为身故保险金",
+                source_doc_id="15", source_node_id="n15", source_pages="1-2",
+            ),
+            FactRecord(
+                product="国寿鑫享添盈", field="已领养老年金",
+                formula_or_value="200000", unit="元",
+                quote="已领养老年金20万元",
+                source_doc_id="15", source_node_id="n15", source_pages="1-2",
+            ),
+            # ---- 平安富鸿金生: 身故保险金 = 已交保费 - 已领养老年金 ----
+            FactRecord(
+                product="平安富鸿金生", field="身故保险金",
+                formula_or_value="已交保费-已领养老年金", unit="",
+                quote="按已交保费减去已领年金给付身故保险金",
+                source_doc_id="16", source_node_id="n16", source_pages="3-4",
+            ),
+            FactRecord(
+                product="平安富鸿金生", field="已领养老年金",
+                formula_or_value="150000", unit="元",
+                quote="已领养老年金15万元",
+                source_doc_id="16", source_node_id="n16", source_pages="3-4",
+            ),
+        ]
+
+        # Global stem: account_value collides — both products map to same kind.
+        # The parser flattens: 智盈金生's 90万 and 增益宝's 85万 both → account_value.
+        # Last wins = 850000 (增益宝's).  This is the ROOT CAUSE of the bug.
+        # With per-product facts, 智盈金生 resolves to 900000 (correct).
+        parsed = ParsedQuestion(
+            qid="ins_a_001", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={
+                "A": "国寿增益宝 > 平安智盈金生 > 国寿鑫享添盈 > 平安富鸿金生",
+                "B": "国寿增益宝 > 平安智盈金生 > 平安富鸿金生 > 国寿鑫享添盈",
+                "C": "平安智盈金生 > 国寿增益宝 > 平安富鸿金生 > 国寿鑫享添盈",
+                "D": "平安富鸿金生 > 国寿增益宝 > 平安智盈金生 > 国寿鑫享添盈",
+            },
+            answer_format="mcq", type="推理判断",
+            number_conditions=[
+                # 已交保费=100万 (global, correct for all products)
+                {"kind": "premium_paid", "value": 1000000, "unit": "元",
+                 "subject": "已交保费", "snippet": "已交保费100万元", "source": "stem"},
+                # 平安智盈金生: 保单账户价值=90万 → account_value=900000
+                {"kind": "account_value", "value": 900000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "保单账户价值90万元", "source": "stem"},
+                # 国寿增益宝: 个人账户价值=85万 → account_value=850000 (overrides!)
+                {"kind": "account_value", "value": 850000, "unit": "元",
+                 "subject": "个人账户价值", "snippet": "个人账户价值85万元", "source": "stem"},
+                # 国寿增益宝: 基本保额=90万
+                {"kind": "basic_sum_insured", "value": 900000, "unit": "元",
+                 "subject": "基本保额", "snippet": "基本保额90万元", "source": "stem"},
+                # 国寿鑫享添盈: 已领养老年金=20万
+                {"kind": "annuity_received", "value": 200000, "unit": "元",
+                 "subject": "已领养老年金", "snippet": "已领养老年金20万元", "source": "stem"},
+                # 平安富鸿金生: 已领养老年金=15万 (overrides!)
+                {"kind": "annuity_received", "value": 150000, "unit": "元",
+                 "subject": "已领养老年金", "snippet": "已领养老年金15万元", "source": "stem"},
+            ],
+        )
+
+        records = engine.compute_from_facts(parsed, facts)
+
+        assert len(records) == 1, f"Expected 1 record, got {len(records)}"
+        rec = records[0]
+        assert rec.calc_type == "ranking"
+
+        ranked_order = rec.inputs["ranked_order"]
+        ranked_values = rec.inputs["ranked_values"]
+
+        # ---- THE CRITICAL ASSERTION ----
+        # 智盈金生 MUST resolve to 900000 (its own 保单账户价值),
+        # NOT 850000 (增益宝's 个人账户价值 which collides in global stem).
+        assert ranked_values["平安智盈金生"] == "900000", (
+            f"REGRESSION: 智盈金生 resolved to {ranked_values.get('平安智盈金生')} "
+            f"instead of 900000.  Stem collision bug still present!"
+        )
+
+        # Verify all per-product values
+        assert ranked_values["国寿增益宝"] == "1440000"    # 90万 × 1.6
+        assert ranked_values["平安智盈金生"] == "900000"    # 90万 (账户价值)
+        assert ranked_values["平安富鸿金生"] == "850000"    # 100万 − 15万
+        assert ranked_values["国寿鑫享添盈"] == "800000"    # 100万 − 20万
+
+        # Verify ranking order matches option B
+        assert ranked_order == [
+            "国寿增益宝",      # 144万
+            "平安智盈金生",    # 90万
+            "平安富鸿金生",    # 85万
+            "国寿鑫享添盈",    # 80万
+        ], (
+            f"Expected option B order [国寿增益宝, 平安智盈金生, 平安富鸿金生, 国寿鑫享添盈], "
+            f"got {ranked_order}"
+        )
+
+        # Verify formula string contains per-product details
+        assert "1440000" in rec.formula
+        assert "900000" in rec.formula
+        assert "850000" in rec.formula
+        assert "800000" in rec.formula
+
+    def test_parser_tags_product_near_number(self):
+        """Parser tags a stem value with the nearest product name."""
+        from agent.domain_profiles import get_profile
+        from agent.question_parser import QuestionParser
+
+        profile = get_profile("insurance")
+        parser = QuestionParser()
+
+        text = "平安智盈金生保单账户价值90万元，国寿增益宝个人账户价值85万元"
+        conditions = parser._extract_number_conditions(
+            text, source="stem",
+            mentioned_products=["平安智盈金生专属商业养老保险", "国寿增益宝终身寿险（万能型）（2025版）"],
+            product_aliases=profile.product_aliases,
+        )
+
+        # Should extract two numbers: 90万 and 85万
+        account_conditions = [c for c in conditions if c["kind"] == "account_value"]
+        assert len(account_conditions) == 2, (
+            f"Expected 2 account_value conditions, got {len(account_conditions)}: {conditions}"
+        )
+
+        # First: 90万 near 平安智盈金生 (canonical: 平安智盈金生专属商业养老保险)
+        c90 = [c for c in account_conditions if c["value"] == 900000]
+        assert len(c90) == 1
+        assert c90[0]["product"] == "平安智盈金生专属商业养老保险", (
+            f"Expected 90万 tagged with 平安智盈金生专属商业养老保险, got {c90[0].get('product')}"
+        )
+
+        # Second: 85万 near 国寿增益宝 (canonical: 国寿增益宝终身寿险（万能型）（2025版）)
+        c85 = [c for c in account_conditions if c["value"] == 850000]
+        assert len(c85) == 1
+        assert c85[0]["product"] == "国寿增益宝终身寿险（万能型）（2025版）", (
+            f"Expected 85万 tagged with 国寿增益宝终身寿险（万能型）（2025版）, got {c85[0].get('product')}"
+        )
+
+    def test_parser_no_product_when_none_nearby(self):
+        """Parser leaves product=None when no product name is nearby."""
+        from agent.domain_profiles import get_profile
+        from agent.question_parser import QuestionParser
+
+        profile = get_profile("insurance")
+        parser = QuestionParser()
+
+        text = "已交保费100万元，所有产品统一标准"
+        conditions = parser._extract_number_conditions(
+            text, source="stem",
+            mentioned_products=["平安智盈金生"],
+            product_aliases=profile.product_aliases,
+        )
+
+        premium_conditions = [c for c in conditions if c["kind"] == "premium_paid"]
+        assert len(premium_conditions) >= 1
+        # No product name near the number → product should be None
+        for c in premium_conditions:
+            assert c.get("product") is None, (
+                f"Expected product=None for unbranded value, got {c.get('product')}"
+            )
+
+    def test_per_product_stem_lookup_resolves_without_facts(self):
+        """When parser tags products on stem conditions, per-product resolution
+        works even WITHOUT per-product VALUE facts — using tagged stem values."""
+        from agent.calculation import CalculationEngine, FactRecord, _build_per_product_stem_lookup
+
+        engine = CalculationEngine()
+
+        # Facts: only RULE facts, no VALUE facts.  Values come from parser-tagged stem.
+        facts = [
+            FactRecord(
+                product="平安智盈金生", field="身故保险金",
+                formula_or_value="保单账户价值", unit="",
+                quote="身故保险金按保单账户价值给付",
+                source_doc_id="1", source_node_id="n1", source_pages="1-3",
+            ),
+            FactRecord(
+                product="国寿增益宝", field="身故保险金",
+                formula_or_value="基本保额*1.6", unit="",
+                quote="按基本保额的160%给付身故保险金",
+                source_doc_id="2", source_node_id="n2", source_pages="4-6",
+            ),
+        ]
+
+        # Stem with per-product tags (parser tagged them)
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={"A": "a", "B": "b", "C": "c", "D": "d"},
+            answer_format="mcq", type="推理判断",
+            number_conditions=[
+                # 智盈金生's 保单账户价值=90万 → tagged
+                {"kind": "account_value", "value": 900000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "保单账户价值90万", "source": "stem",
+                 "product": "平安智盈金生"},
+                # 增益宝's 个人账户价值=85万 → tagged
+                {"kind": "account_value", "value": 850000, "unit": "元",
+                 "subject": "个人账户价值", "snippet": "个人账户价值85万", "source": "stem",
+                 "product": "国寿增益宝"},
+                {"kind": "basic_sum_insured", "value": 900000, "unit": "元",
+                 "subject": "基本保额", "snippet": "基本保额90万", "source": "stem",
+                 "product": "国寿增益宝"},
+            ],
+        )
+
+        # Verify per-product stem lookup
+        pps = _build_per_product_stem_lookup(parsed)
+        assert "平安智盈金生" in pps
+        assert pps["平安智盈金生"]["account_value"] == 900000
+        assert "国寿增益宝" in pps
+        assert pps["国寿增益宝"]["account_value"] == 850000
+        assert pps["国寿增益宝"]["basic_sum_insured"] == 900000
+
+        records = engine.compute_from_facts(parsed, facts)
+        assert len(records) == 1
+        ranked_order = records[0].inputs["ranked_order"]
+        ranked_values = records[0].inputs["ranked_values"]
+
+        # 增益宝: 90万 * 1.6 = 144万 → 1st
+        # 智盈金生: 90万 (its own account_value, from tagged stem) → 2nd
+        assert ranked_order[0] == "国寿增益宝"
+        assert ranked_order[1] == "平安智盈金生"
+        assert ranked_values["国寿增益宝"] == "1440000"
+        assert ranked_values["平安智盈金生"] == "900000"

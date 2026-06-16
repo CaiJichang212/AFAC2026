@@ -777,6 +777,9 @@ class CalculationEngine:
         inputs_per_product: dict[str, Any] = {}
         supporting_facts: list[dict[str, Any]] = []
 
+        # Build per-product stem lookup from parser-tagged conditions
+        per_product_stem = _build_per_product_stem_lookup(parsed)
+
         for product, pfacts in product_facts.items():
             # Find the death-benefit rule fact for this product
             db_fact = _find_fact(pfacts, "身故保险金")
@@ -787,20 +790,27 @@ class CalculationEngine:
             # plain numeric formula_or_value contributes a per-product value
             # that overrides the global stem value (e.g. product-specific
             # 已领养老年金 differs from the stem-wide default).
-            product_overrides: dict[str, float] = {}
+            product_fact_overrides: dict[str, float] = {}
             for pf in pfacts:
                 if pf.field == "身故保险金":
                     continue  # skip the rule itself
                 try:
-                    product_overrides[_FIELD_TO_STEM_KIND.get(pf.field, pf.field)] = float(pf.formula_or_value)
+                    product_fact_overrides[_FIELD_TO_STEM_KIND.get(pf.field, pf.field)] = float(pf.formula_or_value)
                 except (ValueError, TypeError):
                     pass
 
-            # Merge: per-product overrides take priority over stem values
-            eval_stem = dict(stem_values)
-            eval_stem.update(product_overrides)
+            # Build per-product lookup for evaluate_formula:
+            # Priority: product_fact_overrides > per_product_stem > (global fallback)
+            pv: dict[str, float] = {}
+            # Start with per-product stem values for this product
+            p_stem = per_product_stem.get(product, {})
+            pv.update(p_stem)
+            # Per-product fact overrides take highest priority
+            pv.update(product_fact_overrides)
 
-            value = evaluate_formula(db_fact.formula_or_value, eval_stem)
+            value = evaluate_formula(
+                db_fact.formula_or_value, stem_values, product_values=pv
+            )
             if value is None:
                 continue
 
@@ -944,7 +954,25 @@ class CalculationEngine:
         inputs_per_product: dict[str, Any] = {}
         supporting_facts: list[dict[str, Any]] = []
 
+        per_product_stem = _build_per_product_stem_lookup(parsed)
+
         for product, pfacts in product_facts.items():
+            # Build per-product value overrides from facts
+            product_fact_overrides: dict[str, float] = {}
+            for pf in pfacts:
+                if pf.field == "现金价值":
+                    continue
+                try:
+                    product_fact_overrides[_FIELD_TO_STEM_KIND.get(pf.field, pf.field)] = float(pf.formula_or_value)
+                except (ValueError, TypeError):
+                    pass
+
+            # Build per-product lookup for evaluate_formula
+            pv: dict[str, float] = {}
+            p_stem = per_product_stem.get(product, {})
+            pv.update(p_stem)
+            pv.update(product_fact_overrides)
+
             # Look for a cash-value fact for this product
             cv_fact = _find_fact(pfacts, "现金价值")
             if cv_fact is None:
@@ -955,9 +983,10 @@ class CalculationEngine:
             try:
                 cv_value = float(cv_fact.formula_or_value)
             except (ValueError, TypeError):
-                # Try expression evaluation
-                eval_stem = dict(stem_values)
-                cv_value = evaluate_formula(cv_fact.formula_or_value, eval_stem)
+                # Try expression evaluation with per-product context
+                cv_value = evaluate_formula(
+                    cv_fact.formula_or_value, stem_values, product_values=pv
+                )
 
             if cv_value is None:
                 continue
@@ -1076,6 +1105,8 @@ def is_computation_question(parsed: ParsedQuestion) -> bool:
 def evaluate_formula(
     formula_or_value: str,
     stem_values: dict[str, float],
+    *,
+    product_values: dict[str, float] | None = None,
 ) -> float | None:
     """Evaluate a fact ``formula_or_value`` against stem condition values.
 
@@ -1086,6 +1117,11 @@ def evaluate_formula(
     * Field × multiplier: ``"基本保额*1.6"`` → stem[basic_sum_insured] × 1.6
     * Field − field: ``"已交保费-已领养老年金"`` →
       stem[premium_paid] − stem[annuity_received]
+
+    Resolution priority for field references (highest first):
+
+    1. *product_values* — per-product overrides (fact values + per-product stem)
+    2. *stem_values* — global fallback
 
     Returns the numeric result, or None when the expression cannot be
     evaluated (unknown field, missing stem value).
@@ -1108,15 +1144,26 @@ def evaluate_formula(
     except ValueError:
         pass
 
+    # Helper: resolve a field-kind to a numeric value
+    def _resolve(kind: str) -> float | None:
+        # Priority 1: per-product overrides
+        if product_values is not None and kind in product_values:
+            return product_values[kind]
+        # Priority 2: global stem fallback
+        return stem_values.get(kind)
+
     # Case 2: field * multiplier  (e.g. "基本保额*1.6")
     m_mult = re.match(r'^(.+?)\*([\d.]+)$', expr)
     if m_mult:
         field_name = m_mult.group(1).strip()
         multiplier = float(m_mult.group(2))
         kind = _FIELD_TO_STEM_KIND.get(field_name)
-        if kind is None or kind not in stem_values:
+        if kind is None:
             return None
-        return stem_values[kind] * multiplier
+        val = _resolve(kind)
+        if val is None:
+            return None
+        return val * multiplier
 
     # Case 3: field - field  (e.g. "已交保费-已领养老年金")
     m_sub = re.match(r'^(.+?)-(.+)$', expr)
@@ -1125,16 +1172,20 @@ def evaluate_formula(
         right_name = m_sub.group(2).strip()
         left_kind = _FIELD_TO_STEM_KIND.get(left_name)
         right_kind = _FIELD_TO_STEM_KIND.get(right_name)
-        if left_kind is None or left_kind not in stem_values:
+        if left_kind is None or right_kind is None:
             return None
-        if right_kind is None or right_kind not in stem_values:
+        left_val = _resolve(left_kind)
+        right_val = _resolve(right_kind)
+        if left_val is None or right_val is None:
             return None
-        return stem_values[left_kind] - stem_values[right_kind]
+        return left_val - right_val
 
     # Case 4: plain field reference (e.g. "保单账户价值")
     kind = _FIELD_TO_STEM_KIND.get(expr)
-    if kind is not None and kind in stem_values:
-        return stem_values[kind]
+    if kind is not None:
+        val = _resolve(kind)
+        if val is not None:
+            return val
 
     return None
 
@@ -1152,3 +1203,24 @@ def _find_fact(
         if f.field == field:
             return f
     return None
+
+
+# ---------------------------------------------------------------------------
+# Phase D: Per-product stem lookup
+# ---------------------------------------------------------------------------
+
+
+def _build_per_product_stem_lookup(
+    parsed: ParsedQuestion,
+) -> dict[str, dict[str, float]]:
+    """Build ``{product_name: {kind: value}}`` from parser-tagged stem conditions.
+
+    Only conditions that carry a non-None ``product`` field are included.
+    Returns an empty dict when no conditions have product tags.
+    """
+    result: dict[str, dict[str, float]] = {}
+    for cond in parsed.stem_number_conditions:
+        product = cond.get("product")
+        if product is not None and isinstance(product, str) and product:
+            result.setdefault(product, {})[cond["kind"]] = cond["value"]
+    return result
