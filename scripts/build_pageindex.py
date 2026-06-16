@@ -109,7 +109,7 @@ def main() -> None:
             print(f"  WARNING: no page_map for doc {doc_id}, using empty mapping")
             line_to_page = {}
 
-        spans = compute_node_spans(tree, line_to_page)
+        spans = compute_node_spans(tree, line_to_page, doc_id)
         spans_path = pageindex_dir / f"{doc_id}.node_spans.json"
         with open(spans_path, "w", encoding="utf-8") as f:
             json.dump(spans, f, ensure_ascii=False, indent=2)
@@ -138,7 +138,7 @@ def main() -> None:
                         with open(fb_out_path, "w", encoding="utf-8") as f:
                             json.dump(fb_tree, f, ensure_ascii=False, indent=2)
 
-                        fb_spans = compute_node_spans(fb_tree, line_to_page)
+                        fb_spans = compute_node_spans(fb_tree, line_to_page, doc_id)
                         with open(spans_path, "w", encoding="utf-8") as f:
                             json.dump(fb_spans, f, ensure_ascii=False, indent=2)
 

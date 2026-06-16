@@ -42,12 +42,13 @@ def _flatten_tree(nodes: list[dict], level: int = 0) -> list[dict]:
 def compute_node_spans(
     tree: dict,
     line_to_page: dict[str, int],
+    doc_id: int | None = None,
 ) -> list[dict]:
     """Compute source-page spans for every node in *tree*.
 
     Returns a list of dicts, one per node in depth-first order, with keys:
-    ``node_id``, ``title``, ``start_line``, ``end_line``, ``start_page``,
-    ``end_page``, ``source_page_range``, ``bad``.
+    ``doc_id``, ``node_id``, ``title``, ``start_line``, ``end_line``,
+    ``start_page``, ``end_page``, ``source_page_range``, ``bad``.
     """
     line_count: int = tree.get("line_count", 0)
     nodes: list[dict] = tree.get("structure", [])
@@ -59,6 +60,11 @@ def compute_node_spans(
     # Fallback line_count: max key from line_to_page
     if line_count == 0 and line_to_page:
         line_count = max(int(k) for k in line_to_page)
+
+    # Pre-compute the maximum mapped line so we can clamp end_line and avoid
+    # false "bad" marks on the last node(s) whose end_line == line_count
+    # (which is one past the last mapped markdown line).
+    max_mapped: int = max(int(k) for k in line_to_page) if line_to_page else 0
 
     spans: list[dict] = []
     n = len(flat)
@@ -73,6 +79,11 @@ def compute_node_spans(
             if flat[j].get("_level", 0) <= level:
                 end_line = flat[j]["line_num"] - 1
                 break
+
+        # Clamp end_line to the maximum mapped markdown line so the last
+        # node(s) resolve to a valid page instead of being marked bad.
+        if max_mapped > 0:
+            end_line = min(end_line, max_mapped)
 
         # Guard malformed spans
         bad: bool = False
@@ -97,6 +108,7 @@ def compute_node_spans(
                 )
 
         spans.append({
+            "doc_id": doc_id,
             "node_id": node["node_id"],
             "title": node.get("title", ""),
             "start_line": start_line,
@@ -268,11 +280,19 @@ class IndexStore:
 
         try:
             spans = self._load_node_spans(doc_id)
-            # Infer status from spans: if any are bad, degraded
-            bad_count = sum(1 for s in spans if s.get("bad", False))
-            index_status = "degraded" if bad_count > 0 else "ok"
+            # Infer index_source from the first span record
             if spans and spans[0].get("index_source"):
                 index_source = spans[0]["index_source"]
+            # Use the SAME quality computation as compute_index_quality so the
+            # status here can never disagree with the quality log.
+            quality = compute_index_quality(
+                doc_id=doc_id,
+                spans=spans,
+                keywords=self._profile.keywords,
+                index_source=index_source,
+                thresholds=self._profile.quality_thresholds,
+            )
+            index_status = quality["status"]
         except FileNotFoundError:
             pass
 

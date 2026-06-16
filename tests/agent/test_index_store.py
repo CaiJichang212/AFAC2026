@@ -222,6 +222,65 @@ def test_compute_node_spans_malformed_start_gt_end() -> None:
 
 
 # ======================================================================
+# compute_node_spans -- last node end_line clamped to max_mapped
+# ======================================================================
+
+
+def test_compute_node_spans_last_node_clamped() -> None:
+    """When line_count exceeds max_mapped, the last node's end_line is clamped
+    so it resolves to a valid page instead of being marked bad."""
+    tree = {
+        "doc_name": "test",
+        "line_count": 200,
+        "structure": [
+            {"node_id": "a", "title": "Node A", "line_num": 10},
+            {"node_id": "b", "title": "Node B", "line_num": 30},
+        ],
+    }
+    # max_mapped = 50 (line 50 maps to page 2).  line 200 is NOT mapped.
+    ltp = _make_page_map(
+        [10, 29, 30, 50],
+        [1, 1, 1, 2],
+    )
+    spans = compute_node_spans(tree, ltp)
+    assert len(spans) == 2
+
+    # Node A: start=10, end=29 (B.line_num-1), both mapped -> page 1
+    assert spans[0]["node_id"] == "a"
+    assert spans[0]["end_line"] == 29
+    assert spans[0]["bad"] is False
+    assert spans[0]["source_page_range"] == "1"
+
+    # Node B: start=30, end_line would be 200 (line_count), clamped to 50
+    assert spans[1]["node_id"] == "b"
+    assert spans[1]["end_line"] == 50  # clamped from 200 to max_mapped
+    assert spans[1]["bad"] is False
+    assert spans[1]["source_page_range"] == "1-2"
+
+
+# ======================================================================
+# compute_node_spans -- doc_id field in records
+# ======================================================================
+
+
+def test_compute_node_spans_includes_doc_id() -> None:
+    """Every node_spans record includes ``doc_id`` (contract from plan section 4.3)."""
+    tree = _make_flat_tree([
+        ("a", "A", 10),
+        ("b", "B", 20),
+        ("c", "C", 30),
+    ], line_count=100)
+    ltp = _make_page_map([10, 19, 20, 29, 30, 100], [1, 1, 1, 1, 1, 2])
+    spans = compute_node_spans(tree, ltp, doc_id=42)
+    assert len(spans) == 3
+    for s in spans:
+        assert s["doc_id"] == 42, f"Expected doc_id=42, got {s.get('doc_id')}"
+    # Also verify the existing fields are still present
+    assert spans[0]["bad"] is False
+    assert spans[0]["source_page_range"] == "1"
+
+
+# ======================================================================
 # compute_node_spans -- empty tree
 # ======================================================================
 
@@ -471,11 +530,21 @@ def test_get_page_content_single_page() -> None:
 
 
 def test_get_document_metadata() -> None:
-    """``get_document_metadata`` returns expected keys and product_name."""
+    """``get_document_metadata`` returns expected keys and product_name.
+
+    Must have >= min_nodes (3) for status="ok" because the refactored
+    ``get_document_metadata`` delegates to ``compute_index_quality``.
+    """
     config = _make_temp_config()
     tree = {"doc_name": "1", "line_count": 50, "structure": []}
     spans = [
         {"node_id": "a", "title": "A", "source_page_range": "1",
+         "start_line": 1, "end_line": 50, "start_page": 1, "end_page": 1, "bad": False,
+         "index_source": "markdown"},
+        {"node_id": "b", "title": "B", "source_page_range": "1",
+         "start_line": 1, "end_line": 50, "start_page": 1, "end_page": 1, "bad": False,
+         "index_source": "markdown"},
+        {"node_id": "c", "title": "C", "source_page_range": "1",
          "start_line": 1, "end_line": 50, "start_page": 1, "end_page": 1, "bad": False,
          "index_source": "markdown"},
     ]
@@ -492,6 +561,74 @@ def test_get_document_metadata() -> None:
     assert meta["page_count"] == 2
     assert meta["index_status"] == "ok"
     assert meta["index_source"] == "markdown"
+
+
+# ======================================================================
+# get_document_metadata -- status MUST agree with compute_index_quality
+# ======================================================================
+
+
+def test_get_document_metadata_status_agrees_with_quality_ok() -> None:
+    """``get_document_metadata`` status MUST match ``compute_index_quality``
+    for a document that is OK (high coverage, enough nodes)."""
+    config = _make_temp_config()
+    tree = {"doc_name": "1", "line_count": 100, "structure": [
+        {"node_id": "a", "title": "OK A", "line_num": 10},
+        {"node_id": "b", "title": "OK B", "line_num": 20},
+        {"node_id": "c", "title": "OK C", "line_num": 30},
+        {"node_id": "d", "title": "OK D", "line_num": 40},
+    ]}
+    # 4 nodes, all good -> coverage 1.0, should be "ok"
+    spans = [
+        {"node_id": "a", "title": "OK A", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+        {"node_id": "b", "title": "OK B", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+        {"node_id": "c", "title": "OK C", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+        {"node_id": "d", "title": "OK D", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+    ]
+    _write_artifacts(config, 1, tree, spans)
+
+    store = IndexStore(config)
+    meta = store.get_document_metadata(1)
+
+    # Compute quality independently with the same parameters
+    q = compute_index_quality(1, spans, store._profile.keywords, "markdown",
+                              store._profile.quality_thresholds)
+    assert q["status"] == "ok", f"Expected quality ok, got {q['status']!r}"
+    assert meta["index_status"] == q["status"], (
+        f"get_document_metadata status {meta['index_status']!r} "
+        f"!= compute_index_quality status {q['status']!r}"
+    )
+
+
+def test_get_document_metadata_status_agrees_with_quality_degraded() -> None:
+    """``get_document_metadata`` status MUST match ``compute_index_quality``
+    for a degraded document (low coverage)."""
+    config = _make_temp_config()
+    tree = {"doc_name": "1", "line_count": 100, "structure": [
+        {"node_id": "a", "title": "Bad A", "line_num": 10},
+        {"node_id": "b", "title": "Bad B", "line_num": 20},
+        {"node_id": "c", "title": "Bad C", "line_num": 30},
+        {"node_id": "d", "title": "Bad D", "line_num": 40},
+    ]}
+    # 2 bad out of 4 -> coverage 50%, should be degraded
+    spans = [
+        {"node_id": "a", "title": "Bad A", "source_page_range": "", "bad": True, "index_source": "markdown"},
+        {"node_id": "b", "title": "Bad B", "source_page_range": "", "bad": True, "index_source": "markdown"},
+        {"node_id": "c", "title": "Bad C", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+        {"node_id": "d", "title": "Bad D", "source_page_range": "1", "bad": False, "index_source": "markdown"},
+    ]
+    _write_artifacts(config, 1, tree, spans)
+
+    store = IndexStore(config)
+    meta = store.get_document_metadata(1)
+
+    q = compute_index_quality(1, spans, store._profile.keywords, "markdown",
+                              store._profile.quality_thresholds)
+    assert q["status"] == "degraded", f"Expected quality degraded, got {q['status']!r}"
+    assert meta["index_status"] == q["status"], (
+        f"get_document_metadata status {meta['index_status']!r} "
+        f"!= compute_index_quality status {q['status']!r}"
+    )
 
 
 # ======================================================================
@@ -518,19 +655,30 @@ def test_integration_doc1_node_spans() -> None:
     pm = json.loads(pm_path.read_text(encoding="utf-8"))
     line_to_page = pm["line_to_page"]
 
-    spans = compute_node_spans(tree, line_to_page)
+    spans = compute_node_spans(tree, line_to_page, doc_id=1)
     assert len(spans) > 0, "Expected non-empty node spans for doc 1"
 
     bad_count = sum(1 for s in spans if s["bad"])
     good_count = len(spans) - bad_count
     assert good_count > 0, "Expected at least some valid page ranges"
 
-    # Every non-bad span must have a non-empty source_page_range
+    # Every span record must include doc_id
     for s in spans:
+        assert s.get("doc_id") == 1, f"Node {s.get('node_id')} missing doc_id"
         if not s["bad"]:
             assert s["source_page_range"], f"Node {s['node_id']} has empty source_page_range"
             assert s["start_page"] > 0
             assert s["end_page"] > 0
+
+    # The last node MUST resolve (clamped end_line) — not be bad
+    last = spans[-1]
+    assert not last["bad"], (
+        f"Last node {last['node_id']!r} is bad (end_line={last['end_line']}); "
+        f"end_line clamping may be missing"
+    )
+    assert last["source_page_range"], (
+        f"Last node {last['node_id']!r} has empty page range"
+    )
 
     # Compute quality
     keywords = ["保险", "责任", "条款", "合同", "投保", "理赔"]
@@ -539,3 +687,8 @@ def test_integration_doc1_node_spans() -> None:
     assert q["node_count"] == len(spans)
     assert "page_mapping_coverage" in q
     assert "status" in q
+    # After clamping fix, bad_page_range_count should be 0 (or very low)
+    assert q["bad_page_range_count"] <= 1, (
+        f"bad_page_range_count={q['bad_page_range_count']} too high; "
+        f"expected near 0 after clamping fix"
+    )
