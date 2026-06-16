@@ -208,6 +208,26 @@ class TestLLMClientWithMock:
         client = LLMClient.from_config(config)
         assert client._api_caller is None  # skeleton mode
 
+    def test_reasoning_content_fallback(self) -> None:
+        """When message.content is empty, fall back to message.reasoning_content."""
+        canned = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": '{"answer": "from reasoning"}',
+                }
+            }],
+            "model": "ark-code-latest",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }
+        mock = MockApiCaller(responses=[canned])
+        client = LLMClient(model="ark-code-latest", api_caller=mock)
+        response = client.chat(messages=_simple_messages())
+        assert response.content == '{"answer": "from reasoning"}'
+        assert response.prompt_tokens == 10
+        assert response.completion_tokens == 20
+        assert response.total_tokens == 30
+
 
 # ---------------------------------------------------------------------------
 # Real smoke test (guarded by ARK_API_KEY)
@@ -224,9 +244,9 @@ class TestRealArkEndpoint:
     def test_trivial_prompt_returns_ok(self) -> None:
         """Send a trivial prompt to ark-code-latest and verify a valid response.
 
-        Note: the ARK coding model (ark-code-latest) requires temperature > 0;
-        at temperature=0.0 all completion tokens are internal reasoning tokens
-        and ``content`` is empty.
+        Note: ark-code-latest returns its answer in ``message.content`` and
+        works at temperature=0.0 as well as 0.6.  A defensive fallback reads
+        ``reasoning_content`` for models that emit their answer there instead.
         """
         api_key = os.environ.get("ARK_API_KEY")
         if not api_key:

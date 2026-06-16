@@ -78,10 +78,11 @@ class LitellmApiCaller:
 
     .. note::
 
-        The ARK coding model (ark-code-latest) returns only internal
-        reasoning tokens when ``temperature=0.0``, producing empty
-        ``content``.  Use ``temperature > 0`` (e.g. 0.6) or switch to a
-        non-coding model for final submission.
+        The ARK coding model (ark-code-latest) returns its answer in
+        ``message.content`` and works at temperature=0.0 as well as 0.6.
+        For reasoning models (and some ARK endpoints) the answer may appear
+        in ``message.reasoning_content`` instead; a defensive fallback reads
+        ``reasoning_content`` when ``content`` is empty.
     """
 
     def __init__(self, *, base_url: str, api_key: str) -> None:
@@ -121,7 +122,10 @@ def _litellm_response_to_dict(response: Any) -> dict[str, Any]:
         msg = getattr(choice, "message", None)
         msg_dict: dict[str, Any] = {}
         if msg is not None:
-            msg_dict["content"] = getattr(msg, "content", "") or ""
+            content = getattr(msg, "content", None) or ""
+            if not content:
+                content = getattr(msg, "reasoning_content", None) or ""
+            msg_dict["content"] = content
             msg_dict["role"] = getattr(msg, "role", "assistant")
         choices.append(
             {
@@ -329,8 +333,11 @@ class LLMClient:
 
         latency_ms = (time.monotonic() - t0) * 1000.0
 
-        # Extract content
-        content = raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # Extract content (with reasoning_content fallback for reasoning models)
+        msg = raw.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content", "") or ""
+        if not content:
+            content = msg.get("reasoning_content", "") or ""
 
         # Extract usage
         usage = raw.get("usage", {})
