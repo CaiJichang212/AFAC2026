@@ -29,7 +29,8 @@ class ParsedQuestion:
 
     # Optional parsed signals (fleshed out in later tasks)
     mentioned_products: list[str] = field(default_factory=list)
-    doc_product_map: dict[str, list[str]] = field(default_factory=dict)
+    doc_product_map: dict[str, str] = field(default_factory=dict)
+    liability_signals: list[str] = field(default_factory=list)
     number_conditions: list[dict[str, Any]] = field(default_factory=list)
 
 
