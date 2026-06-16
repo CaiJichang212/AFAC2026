@@ -28,8 +28,15 @@ class AgentConfig:
     output_root: Path = field(default_factory=lambda: Path("outputs"))
 
     # -- model selection -----------------------------------------------------
-    inference_model: str = "dashscope/qwen3.6-plus"
+    # DEV: uses the Volcengine ARK coding plan (ark-code-latest).
+    # FINAL SUBMISSION: must regenerate results with a real Qwen model
+    # (e.g. dashscope/qwen3.6-plus) and update inference_model accordingly.
+    inference_model: str = "ark-code-latest"
     dev_model: str | None = None  # cheaper model for dev / dry-run
+
+    # -- inference endpoint ---------------------------------------------------
+    inference_base_url: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
+    inference_api_key_env: str = "ARK_API_KEY"  # name of env var holding the key
 
     # -- PageIndex build parameters (section 4.1) ----------------------------
     toc_check_page_num: int = 20
@@ -104,6 +111,15 @@ class AgentConfig:
         """Index quality JSONL file for this domain."""
         return self.quality_dir / f"{self.domain}_index_quality.jsonl"
 
+    @property
+    def inference_api_key(self) -> str | None:
+        """Read the API key from the configured environment variable.
+
+        Returns None when the env var is not set, so callers can fall back
+        to a mock client.
+        """
+        return os.environ.get(self.inference_api_key_env)
+
     # ------------------------------------------------------------------------
     # Factory helpers
     # ------------------------------------------------------------------------
@@ -122,6 +138,8 @@ class AgentConfig:
             "output_root",
             "inference_model",
             "dev_model",
+            "inference_base_url",
+            "inference_api_key_env",
             "toc_check_page_num",
             "max_page_num_each_node",
             "max_token_num_each_node",
@@ -193,8 +211,10 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--processed-root", default="data/processed_data", help="Processed data root")
     parser.add_argument("--pageindex-root", default="open_projects/PageIndex", help="PageIndex source root")
     parser.add_argument("--output-root", default="outputs", help="Output root")
-    parser.add_argument("--inference-model", default="dashscope/qwen3.6-plus", help="Inference model name")
+    parser.add_argument("--inference-model", default="ark-code-latest", help="Inference model name")
     parser.add_argument("--dev-model", default=None, help="Dev/dry-run model name")
+    parser.add_argument("--inference-base-url", default="https://ark.cn-beijing.volces.com/api/coding/v3", help="Inference endpoint base URL")
+    parser.add_argument("--inference-api-key-env", default="ARK_API_KEY", help="Env var name for the inference API key")
     parser.add_argument("--toc-check-page-num", type=int, default=20, help="TOC check page count")
     parser.add_argument("--max-page-num-each-node", type=int, default=8, help="Max pages per index node")
     parser.add_argument("--max-token-num-each-node", type=int, default=20000, help="Max tokens per index node")

@@ -166,7 +166,7 @@ class TestModelConfig:
 
     def test_default_inference_model(self) -> None:
         cfg = AgentConfig()
-        assert cfg.inference_model == "dashscope/qwen3.6-plus"
+        assert cfg.inference_model == "ark-code-latest"
 
     def test_dev_model_defaults_to_none(self) -> None:
         cfg = AgentConfig()
@@ -175,6 +175,32 @@ class TestModelConfig:
     def test_can_override_dev_model(self) -> None:
         cfg = AgentConfig(dev_model="dashscope/qwen-turbo")
         assert cfg.dev_model == "dashscope/qwen-turbo"
+
+    def test_default_inference_base_url(self) -> None:
+        cfg = AgentConfig()
+        assert cfg.inference_base_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
+
+    def test_default_inference_api_key_env(self) -> None:
+        cfg = AgentConfig()
+        assert cfg.inference_api_key_env == "ARK_API_KEY"
+
+    def test_inference_api_key_property_reads_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "sk-test-123")
+        cfg = AgentConfig()
+        assert cfg.inference_api_key == "sk-test-123"
+
+    def test_inference_api_key_property_returns_none_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("ARK_API_KEY", raising=False)
+        cfg = AgentConfig()
+        assert cfg.inference_api_key is None
+
+    def test_can_override_inference_base_url(self) -> None:
+        cfg = AgentConfig(inference_base_url="https://custom.example.com/v1")
+        assert cfg.inference_base_url == "https://custom.example.com/v1"
+
+    def test_can_override_inference_api_key_env(self) -> None:
+        cfg = AgentConfig(inference_api_key_env="CUSTOM_API_KEY")
+        assert cfg.inference_api_key_env == "CUSTOM_API_KEY"
 
 
 # ---------------------------------------------------------------------------
