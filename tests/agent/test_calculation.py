@@ -1227,3 +1227,111 @@ class TestComputeFromFacts:
         assert len(records[0].formula) > 0
         assert "900000" in records[0].formula
         assert ">" not in records[0].formula  # Sort of single item = no ">"
+
+    def test_ins_a_002_surrender_from_facts(self):
+        """Synthetic fact matrix for ins_a_002 surrender-value ranking.
+
+        Facts:
+        - 平安智盈金生: 现金价值=120000
+        - 国寿增益宝: 现金价值=120000 (退保费用0%)
+        - 平安富鸿金生: 现金价值=90000
+
+        Expected ranking: 国寿增益宝(12万) = 平安智盈金生(12万) > 平安富鸿金生(9万)
+        """
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="平安智盈金生", field="现金价值",
+                formula_or_value="120000", unit="元",
+                quote="累计所交保费10万元，保单账户累计收益2万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-3",
+            ),
+            FactRecord(
+                product="国寿增益宝", field="现金价值",
+                formula_or_value="120000", unit="元",
+                quote="个人账户价值12万元",
+                source_doc_id="2", source_node_id="n2", source_pages="4-6",
+            ),
+            FactRecord(
+                product="平安富鸿金生", field="现金价值",
+                formula_or_value="90000", unit="元",
+                quote="现金价值9万元",
+                source_doc_id="16", source_node_id="n16", source_pages="1-2",
+            ),
+        ]
+        parsed = ParsedQuestion(
+            qid="ins_a_002", domain="insurance", split="A",
+            question="假设投保人分别投保了平安智盈金生、国寿增益宝、平安富鸿金生。"
+                     "则三者退保所得金额从高到低排序为？",
+            options={
+                "A": "国寿增益宝(12万) > 平安智盈金生(11.5万) > 平安富鸿金生(9万)",
+                "B": "平安智盈金生(11.5万) > 国寿增益宝(12万) > 平安富鸿金生(9万)",
+                "C": "国寿增益宝(11.76万) > 平安智盈金生(11.5万) > 平安富鸿金生(9万)",
+                "D": "平安智盈金生(12万) > 国寿增益宝(11.76万) > 平安富鸿金生(9万)",
+            },
+            answer_format="mcq", type="计算题",
+            number_conditions=[
+                {"kind": "premium_paid", "value": 100000, "unit": "元",
+                 "subject": "累计所交保费", "snippet": "", "source": "stem"},
+                {"kind": "account_value", "value": 120000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "", "source": "stem"},
+            ],
+        )
+        records = engine.compute_from_facts(parsed, facts)
+        assert len(records) == 1
+        assert records[0].calc_type == "ranking"
+        ranked_order = records[0].inputs["ranked_order"]
+        # Both 平安智盈金生 and 国寿增益宝 have 120000, 平安富鸿金生 has 90000
+        assert "平安富鸿金生" in ranked_order
+        assert ranked_order.index("平安富鸿金生") == 2  # last place
+        assert len(ranked_order) == 3
+        # Check supporting_facts are present
+        sf = records[0].inputs.get("supporting_facts", [])
+        assert len(sf) >= 3
+
+    def test_surrender_with_charge_rate(self):
+        """Synthetic fact matrix: 现金价值 + 给付比例 (surrender charge rate).
+
+        - 产品A: 现金价值=100000, 给付比例=95 (5% charge) → 95000
+        - 产品B: 现金价值=100000, no charge → 100000
+
+        Expected: 产品B(100000) > 产品A(95000)
+        """
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="产品A", field="现金价值",
+                formula_or_value="100000", unit="元",
+                quote="现金价值10万", source_doc_id="1",
+                source_node_id="n1", source_pages="1-1",
+            ),
+            FactRecord(
+                product="产品A", field="给付比例",
+                formula_or_value="95", unit="%",
+                quote="退保费用率5%", source_doc_id="1",
+                source_node_id="n1", source_pages="1-1",
+            ),
+            FactRecord(
+                product="产品B", field="现金价值",
+                formula_or_value="100000", unit="元",
+                quote="现金价值10万", source_doc_id="2",
+                source_node_id="n2", source_pages="2-2",
+            ),
+        ]
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="三者退保所得金额从高到低排序？",
+            options={"A": "a", "B": "b"}, answer_format="mcq", type="计算题",
+        )
+        records = engine.compute_from_facts(parsed, facts)
+        assert len(records) == 1
+        ranked_order = records[0].inputs["ranked_order"]
+        assert ranked_order[0] == "产品B"
+        assert ranked_order[1] == "产品A"
+        pv = records[0].inputs["product_values"]
+        assert pv["产品B"] == "100000"
+        assert pv["产品A"] == "95000"

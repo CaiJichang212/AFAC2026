@@ -729,6 +729,7 @@ class CalculationEngine:
         has_medical = any(
             kw in question for kw in ("免赔额", "医保报销", "医疗费用")
         )
+        has_surrender = "退保" in question
 
         records: list[CalculationRecord] = []
 
@@ -742,6 +743,13 @@ class CalculationEngine:
         if has_medical:
             records.extend(
                 self._compute_medical_from_facts(
+                    parsed, product_facts, stem_values
+                )
+            )
+
+        if has_surrender:
+            records.extend(
+                self._compute_surrender_from_facts(
                     parsed, product_facts, stem_values
                 )
             )
@@ -917,6 +925,104 @@ class CalculationEngine:
             )
 
         return records
+
+    def _compute_surrender_from_facts(
+        self,
+        parsed: ParsedQuestion,
+        product_facts: dict[str, list[FactRecord]],
+        stem_values: dict[str, float],
+    ) -> list[CalculationRecord]:
+        """Compute per-product surrender values from facts and rank them.
+
+        Looks for 现金价值 (cash value) facts per product.  If a surrender-charge
+        percentage or deductible is present as a fact on the same product it is
+        applied.  Results are ranked descending.
+        """
+        product_values: dict[str, float] = {}
+        formula_details: list[str] = []
+        source_ids: list[str] = []
+        inputs_per_product: dict[str, Any] = {}
+        supporting_facts: list[dict[str, Any]] = []
+
+        for product, pfacts in product_facts.items():
+            # Look for a cash-value fact for this product
+            cv_fact = _find_fact(pfacts, "现金价值")
+            if cv_fact is None:
+                continue
+
+            # Try to parse the cash value as a number or evaluate it
+            cv_value: float | None = None
+            try:
+                cv_value = float(cv_fact.formula_or_value)
+            except (ValueError, TypeError):
+                # Try expression evaluation
+                eval_stem = dict(stem_values)
+                cv_value = evaluate_formula(cv_fact.formula_or_value, eval_stem)
+
+            if cv_value is None:
+                continue
+
+            # Look for surrender-charge rate (optional)
+            charge_rate: float = 0.0
+            charge_fact = _find_fact(pfacts, "给付比例")
+            if charge_fact is not None:
+                try:
+                    charge_rate = float(charge_fact.formula_or_value)
+                except (ValueError, TypeError):
+                    pass
+
+            surrender_value = cv_value * (charge_rate / 100.0) if charge_rate else cv_value
+            if surrender_value == int(surrender_value):
+                surrender_value = int(surrender_value)
+            else:
+                surrender_value = round(surrender_value, 2)
+
+            product_values[product] = surrender_value
+            sid = f"{cv_fact.source_doc_id}/{cv_fact.source_node_id}"
+            source_ids.append(sid)
+            inputs_per_product[product] = {
+                "cash_value": cv_value,
+                "charge_rate_pct": charge_rate,
+                "surrender_value": surrender_value,
+            }
+            charge_detail = f" × {charge_rate}%" if charge_rate else ""
+            formula_details.append(
+                f"{product}: 现金价值{charge_detail} = {_fmt(surrender_value)}元"
+            )
+            supporting_facts.append(asdict(cv_fact))
+            if charge_fact:
+                supporting_facts.append(asdict(charge_fact))
+
+        if not product_values:
+            return []
+
+        ranked_keys, rank_formula = calc_rank_descending(
+            list(product_values.items())
+        )
+
+        record = CalculationRecord(
+            qid=parsed.qid,
+            calc_type="ranking",
+            inputs={
+                "product_values": {
+                    k: _fmt(v) for k, v in product_values.items()
+                },
+                "per_product": inputs_per_product,
+                "ranked_order": ranked_keys,
+                "ranked_values": {
+                    k: _fmt(v) for k, v in sorted(
+                        product_values.items(), key=lambda x: x[1], reverse=True
+                    )
+                },
+                "supporting_facts": supporting_facts,
+            },
+            formula="\n".join(formula_details) + "\n" + rank_formula,
+            result=0.0,
+            unit="",
+            source_evidence_ids=source_ids,
+        )
+
+        return [record]
 
     def _compute_generic_from_facts(
         self,
