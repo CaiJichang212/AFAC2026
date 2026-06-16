@@ -339,7 +339,7 @@ class TestEvidenceExtraction:
                 )
 
     def test_bad_quote_not_in_page_text_not_allowed_high_confidence(self) -> None:
-        """A record with a quote NOT in the page text should not pass with high confidence."""
+        """A support record with a quote NOT in the page text is downgraded to low."""
         extractor = EvidenceExtractor()
         parsed = _make_parsed_question()
         candidate = _make_candidate()
@@ -369,13 +369,183 @@ class TestEvidenceExtraction:
                 llm_client=llm_client,
             )
 
-        # The bad quote shouldn't be equal to the claim text - it's just not in the page
         rec_a = next(r for r in records if r.option == "A")
-        # The record still exists (we don't drop non-matching quotes, the LLM
-        # is trusted to quote correctly). But we can verify the quote is
-        # faithfully passed through.
+        # The quote is faithfully passed through but confidence is downgraded
+        # because it is not traceable to the page text.
         assert rec_a.quote == "这句话不在原文中"
-        assert rec_a.confidence == "high"
+        assert rec_a.confidence == "low"
+
+    # ------------------------------------------------------------------
+    # Quote traceability enforcement (whitespace-normalized substring check)
+    # ------------------------------------------------------------------
+
+    def test_traceable_quote_keeps_claimed_confidence(self) -> None:
+        """A support/refute record whose quote IS a substring of page text
+        keeps its claimed confidence (e.g. high)."""
+        extractor = EvidenceExtractor()
+        parsed = _make_parsed_question()
+        candidate = _make_candidate()
+
+        # Quote IS a verbatim substring of PAGE_6_TEXT
+        verdicts = [
+            {
+                "option": "A",
+                "evidence_type": "support",
+                "quote": "已交保费、基本保险金额的160%、现金价值三者取大。",
+                "normalized_fact": "fact",
+                "confidence": "high",
+            },
+        ]
+        llm_client = _make_mock_llm_client(verdicts)
+
+        with patch.object(
+            IndexStore, "get_page_content", return_value=[
+                _make_page_text(6, PAGE_6_TEXT),
+            ]
+        ):
+            records = extractor.extract(
+                parsed=parsed,
+                candidates=[candidate],
+                index_store=IndexStore(AgentConfig()),
+                config=AgentConfig(),
+                llm_client=llm_client,
+            )
+
+        rec_a = next(r for r in records if r.option == "A" and r.doc_id == "1")
+        assert rec_a.confidence == "high", (
+            f"Traceable quote should keep high confidence, got {rec_a.confidence}"
+        )
+
+    def test_support_fabricated_quote_downgraded_to_low(self) -> None:
+        """A support record whose non-empty quote is NOT a substring of
+        the page text gets its confidence downgraded to 'low'."""
+        extractor = EvidenceExtractor()
+        parsed = _make_parsed_question()
+        candidate = _make_candidate()
+
+        # Quote is hallucinated, not in PAGE_6_TEXT
+        verdicts = [
+            {
+                "option": "A",
+                "evidence_type": "support",
+                "quote": "完全不在原文中的句子",
+                "normalized_fact": "fabricated",
+                "confidence": "high",
+            },
+            {
+                "option": "B",
+                "evidence_type": "refute",
+                "quote": "另一个捏造的引用",
+                "normalized_fact": "fabricated refute",
+                "confidence": "medium",
+            },
+        ]
+        llm_client = _make_mock_llm_client(verdicts)
+
+        with patch.object(
+            IndexStore, "get_page_content", return_value=[
+                _make_page_text(6, PAGE_6_TEXT),
+            ]
+        ):
+            records = extractor.extract(
+                parsed=parsed,
+                candidates=[candidate],
+                index_store=IndexStore(AgentConfig()),
+                config=AgentConfig(),
+                llm_client=llm_client,
+            )
+
+        rec_a = next(r for r in records if r.option == "A" and r.doc_id == "1")
+        rec_b = next(r for r in records if r.option == "B" and r.doc_id == "1")
+
+        # Both should be downgraded to low (not dropped, quote preserved)
+        assert rec_a.confidence == "low", (
+            f"Fabricated quote 'support' should be downgraded, got {rec_a.confidence}"
+        )
+        assert rec_a.quote == "完全不在原文中的句子"
+        assert rec_b.confidence == "low", (
+            f"Fabricated quote 'refute' should be downgraded, got {rec_b.confidence}"
+        )
+        assert rec_b.quote == "另一个捏造的引用"
+
+    def test_quote_traceability_whitespace_tolerance(self) -> None:
+        """Quotes with extra/normalized whitespace vs page text still count
+        as traceable (not downgraded)."""
+        extractor = EvidenceExtractor()
+        parsed = _make_parsed_question()
+        candidate = _make_candidate()
+
+        # Quote has leading/trailing spaces that get stripped by normalisation
+        quote_with_extra_ws = "  已交保费、基本保险金额的160%、现金价值三者取大。  "
+        page_text = PAGE_6_TEXT
+
+        verdicts = [
+            {
+                "option": "A",
+                "evidence_type": "support",
+                "quote": quote_with_extra_ws,
+                "normalized_fact": "fact",
+                "confidence": "high",
+            },
+        ]
+        llm_client = _make_mock_llm_client(verdicts)
+
+        with patch.object(
+            IndexStore, "get_page_content", return_value=[
+                _make_page_text(6, page_text),
+            ]
+        ):
+            records = extractor.extract(
+                parsed=parsed,
+                candidates=[candidate],
+                index_store=IndexStore(AgentConfig()),
+                config=AgentConfig(),
+                llm_client=llm_client,
+            )
+
+        rec_a = next(r for r in records if r.option == "A" and r.doc_id == "1")
+        assert rec_a.confidence == "high", (
+            f"Whitespace-tolerant quote should keep high confidence, got {rec_a.confidence}"
+        )
+
+    def test_unclear_with_fabricated_quote_not_downgraded(self) -> None:
+        """Unclear records with non-substring quotes are NOT downgraded by the
+        traceability check (their confidence is independent)."""
+        extractor = EvidenceExtractor()
+        parsed = _make_parsed_question()
+        candidate = _make_candidate()
+
+        # Unclear record with a quote NOT in page text
+        verdicts = [
+            {
+                "option": "A",
+                "evidence_type": "unclear",
+                "quote": "这句话不在原文中",
+                "normalized_fact": "uncertain",
+                "confidence": "medium",
+            },
+        ]
+        llm_client = _make_mock_llm_client(verdicts)
+
+        with patch.object(
+            IndexStore, "get_page_content", return_value=[
+                _make_page_text(6, PAGE_6_TEXT),
+            ]
+        ):
+            records = extractor.extract(
+                parsed=parsed,
+                candidates=[candidate],
+                index_store=IndexStore(AgentConfig()),
+                config=AgentConfig(),
+                llm_client=llm_client,
+            )
+
+        rec_a = next(r for r in records if r.option == "A" and r.doc_id == "1")
+        # Unclear records are NOT affected by traceability downgrade
+        assert rec_a.evidence_type == "unclear"
+        assert rec_a.confidence == "medium", (
+            f"Unclear record should keep original confidence, got {rec_a.confidence}"
+        )
 
     # ------------------------------------------------------------------
     # Dedup
@@ -390,7 +560,7 @@ class TestEvidenceExtraction:
         cand2 = _make_candidate(node_id="n2", page_range="6-8")
 
         # Both return the same quote for option A
-        same_quote = "已交保费、基本保险况金额的160%、现金价值三者取大。"
+        same_quote = "已交保费、基本保险金额的160%、现金价值三者取大。"
         verdicts1 = [
             {
                 "option": "A",

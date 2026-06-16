@@ -242,6 +242,8 @@ class EvidenceExtractor:
 
         Normalizes evidence_type (rejects unknown values to "unclear"),
         validates quotes against page text, and enforces per-node caps.
+        Downgrades support/refute records whose non-empty quote is not
+        traceable to the page text (whitespace-normalized substring check).
         """
         try:
             data = json.loads(raw_content)
@@ -254,6 +256,7 @@ class EvidenceExtractor:
             logger.warning("LLM verdicts is not a list; got %s", type(verdicts).__name__)
             return []
 
+        norm_full = _normalize_whitespace(full_text)
         records: list[EvidenceRecord] = []
         for v in verdicts:
             if not isinstance(v, dict):
@@ -284,6 +287,17 @@ class EvidenceExtractor:
                         "value": n.get("value", ""),
                         "unit": str(n.get("unit", "")),
                     })
+
+            # Enforce quote traceability: support/refute records whose
+            # non-empty quote cannot be found in the page text (under
+            # whitespace-normalized substring comparison) are downgraded
+            # to "low" so downstream judges weigh them less.
+            if (
+                evidence_type in ("support", "refute")
+                and quote.strip()
+                and _normalize_whitespace(quote) not in norm_full
+            ):
+                confidence = "low"
 
             records.append(
                 EvidenceRecord(
