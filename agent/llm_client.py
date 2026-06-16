@@ -31,6 +31,14 @@ class NonRetryableError(Exception):
     """
 
 
+class LLMEmptyOrTruncatedError(Exception):
+    """Raised when the LLM returns empty content or a truncated (finish_reason="length") response.
+
+    This is a *retryable* failure — the retry loop will increase ``max_tokens``
+    and re-attempt so reasoning models get enough room to finish.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Protocol / interface for the underlying API caller
 # ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ class LLMResponse:
     completion_tokens: int
     total_tokens: int
     latency_ms: float
+    finish_reason: str | None = None
     raw: dict[str, Any] | None = None
 
 
@@ -297,7 +306,12 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     def _call_with_retry(self, *, messages: list[dict[str, Any]], **kwargs: Any) -> LLMResponse:
-        """Retry loop with exponential backoff and error wrapping."""
+        """Retry loop with exponential backoff and error wrapping.
+
+        ``LLMEmptyOrTruncatedError`` is retried with *increased* ``max_tokens``
+        (doubled each attempt, capped at 16384) so reasoning models get enough
+        room to finish.  ``NonRetryableError`` is re-raised immediately.
+        """
         last_error: Exception | None = None
         json_schema = kwargs.pop("_json_schema", None)
 
@@ -306,6 +320,18 @@ class LLMClient:
                 return self._do_call(messages=messages, json_schema=json_schema, **kwargs)
             except NonRetryableError:
                 raise  # JSON validation failures etc. — do NOT retry
+            except LLMEmptyOrTruncatedError as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM call attempt %d/%d empty or truncated: %s",
+                    attempt + 1, self.max_retries + 1, exc,
+                )
+                if attempt < self.max_retries:
+                    delay = self.base_delay * (2**attempt)
+                    time.sleep(delay)
+                    # Increase max_tokens so a reasoning model gets room to finish
+                    current = kwargs.get("max_tokens", 4096)
+                    kwargs["max_tokens"] = min(current * 2, 16384)
             except Exception as exc:
                 last_error = exc
                 logger.warning("LLM call attempt %d/%d failed: %s", attempt + 1, self.max_retries + 1, exc)
@@ -334,10 +360,13 @@ class LLMClient:
         latency_ms = (time.monotonic() - t0) * 1000.0
 
         # Extract content (with reasoning_content fallback for reasoning models)
-        msg = raw.get("choices", [{}])[0].get("message", {})
+        first_choice = raw.get("choices", [{}])[0]
+        msg = first_choice.get("message", {})
         content = msg.get("content", "") or ""
         if not content:
             content = msg.get("reasoning_content", "") or ""
+
+        finish_reason: str | None = first_choice.get("finish_reason")
 
         # Extract usage
         usage = raw.get("usage", {})
@@ -345,8 +374,14 @@ class LLMClient:
         completion_tokens = usage.get("completion_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
 
-        # Validate JSON schema if requested
-        if json_schema is not None and content:
+        # When json_schema is requested, empty content or truncated (length)
+        # responses are NOT acceptable — raise a retryable error.
+        if json_schema is not None:
+            if not content or finish_reason == "length":
+                raise LLMEmptyOrTruncatedError(
+                    f"LLM response empty or truncated "
+                    f"(content_len={len(content)}, finish_reason={finish_reason!r})"
+                )
             self._validate_json_response(content, json_schema)
 
         return LLMResponse(
@@ -356,6 +391,7 @@ class LLMClient:
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             latency_ms=latency_ms,
+            finish_reason=finish_reason,
             raw=raw,
         )
 

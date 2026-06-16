@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from typing import Any
 
 import pytest
 
 from agent.llm_client import (
     LitellmApiCaller,
     LLMClient,
+    LLMEmptyOrTruncatedError,
     LLMResponse,
     MockApiCaller,
     NonRetryableError,
@@ -24,10 +26,13 @@ from agent.token_meter import TokenMeter
 # ---------------------------------------------------------------------------
 
 
-def _canned_response(content: str = "OK", *, model: str = "ark-code-latest") -> dict:
+def _canned_response(content: str = "OK", *, model: str = "ark-code-latest", finish_reason: str | None = None) -> dict:
     """Build a minimal OpenAI-compatible canned response dict."""
+    choice: dict[str, Any] = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
     return {
-        "choices": [{"message": {"content": content}}],
+        "choices": [choice],
         "model": model,
         "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
     }
@@ -227,6 +232,104 @@ class TestLLMClientWithMock:
         assert response.prompt_tokens == 10
         assert response.completion_tokens == 20
         assert response.total_tokens == 30
+
+    # ------------------------------------------------------------------
+    # Phase A: honest empty/truncated handling
+    # ------------------------------------------------------------------
+
+    def test_empty_content_with_json_schema_raises_after_retries(self) -> None:
+        """Empty content + json_schema + finish_reason="length" must NOT be a
+        silent success — after retries are exhausted a RuntimeError is raised."""
+        mock = MockApiCaller(responses=[
+            _canned_response("", finish_reason="length"),
+            _canned_response("", finish_reason="length"),
+            _canned_response("", finish_reason="length"),
+        ])
+        client = LLMClient(model="m", api_caller=mock, max_retries=2, base_delay=0.001)
+        with pytest.raises(RuntimeError, match="LLM call failed after 3 attempts"):
+            client.chat(messages=_simple_messages(), json_schema={"type": "object"})
+        # All 3 calls were made (no early bail-out)
+        assert len(mock.calls) == 3
+
+    def test_empty_content_no_json_schema_returns_empty_response(self) -> None:
+        """Without json_schema, empty content is fine (no validation required)."""
+        mock = MockApiCaller(responses=[_canned_response("", finish_reason="length")])
+        client = LLMClient(model="m", api_caller=mock)
+        response = client.chat(messages=_simple_messages())
+        assert response.content == ""
+        assert response.finish_reason == "length"
+
+    def test_retry_on_truncation_increases_max_tokens(self) -> None:
+        """First call returns empty+length; retry uses doubled max_tokens, capped at 16384."""
+        mock = MockApiCaller(responses=[
+            _canned_response("", finish_reason="length"),
+            _canned_response('{"key": "value"}', finish_reason="stop"),
+        ])
+        client = LLMClient(model="m", api_caller=mock, max_retries=2, base_delay=0.001)
+        response = client.chat(
+            messages=_simple_messages(),
+            json_schema={"type": "object"},
+            max_tokens=4096,
+        )
+        assert response.content == '{"key": "value"}'
+        assert len(mock.calls) == 2
+        # Second call must have larger max_tokens than the first
+        mt1 = mock.calls[0]["kwargs"].get("max_tokens")
+        mt2 = mock.calls[1]["kwargs"].get("max_tokens")
+        assert mt1 is not None
+        assert mt2 is not None
+        assert mt2 > mt1, f"Expected max_tokens to increase on retry: {mt1} -> {mt2}"
+        assert mt2 == min(mt1 * 2, 16384)
+
+    def test_finish_reason_populated_on_success(self) -> None:
+        """A normal (non-truncated) success carries finish_reason on LLMResponse."""
+        mock = MockApiCaller(responses=[
+            _canned_response('{"key": "value"}', finish_reason="stop"),
+        ])
+        client = LLMClient(model="m", api_caller=mock)
+        response = client.chat(messages=_simple_messages(), json_schema={"type": "object"})
+        assert response.content == '{"key": "value"}'
+        assert response.finish_reason == "stop"
+
+    def test_non_retryable_error_still_not_retried(self) -> None:
+        """Malformed JSON with non-empty content raises NonRetryableError
+        immediately — no retries, no max_tokens bump."""
+        mock = MockApiCaller(responses=[_canned_response("not json")])
+        client = LLMClient(model="m", api_caller=mock, max_retries=3, base_delay=0.001)
+        with pytest.raises(NonRetryableError, match="LLM response is not valid JSON"):
+            client.chat(messages=_simple_messages(), json_schema={"type": "object"})
+        # Only ONE call was made — no retry
+        assert len(mock.calls) == 1
+
+    def test_skeleton_mode_still_returns_non_empty_response(self) -> None:
+        """Skeleton mode (no api_caller) returns a non-empty _skeleton response
+        and is NOT broken by the new empty/truncated checks."""
+        client = LLMClient(model="test-model")  # no api_caller → skeleton
+        response = client.chat(messages=_simple_messages(), json_schema={"type": "object"})
+        assert response.content  # non-empty
+        data = json.loads(response.content)
+        assert data.get("_skeleton") is True
+
+    def test_truncated_with_non_empty_reasoning_content_raises(self) -> None:
+        """Even when reasoning_content provides non-empty content, if
+        finish_reason is 'length' the response is still treated as
+        truncated and raises LLMEmptyOrTruncatedError (retries exhausted)."""
+        canned = {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "",
+                    "reasoning_content": "some reasoning text",
+                },
+            }],
+            "model": "m",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 0, "total_tokens": 100},
+        }
+        mock = MockApiCaller(responses=[canned, canned, canned])
+        client = LLMClient(model="m", api_caller=mock, max_retries=2, base_delay=0.001)
+        with pytest.raises(RuntimeError, match="LLM call failed after 3 attempts"):
+            client.chat(messages=_simple_messages(), json_schema={"type": "object"})
+        assert len(mock.calls) == 3
 
 
 # ---------------------------------------------------------------------------

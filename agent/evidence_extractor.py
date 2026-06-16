@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from agent.config import AgentConfig
@@ -202,12 +203,33 @@ class EvidenceExtractor:
         # Real calls MUST use temperature > 0.
         temperature = 0.6
 
-        response: LLMResponse = llm_client.chat(
-            messages=messages,
-            json_schema=_EVIDENCE_JSON_SCHEMA,
-            temperature=temperature,
-            max_tokens=4096,
-        )
+        t0 = time.monotonic()
+        try:
+            response: LLMResponse = llm_client.chat(
+                messages=messages,
+                json_schema=_EVIDENCE_JSON_SCHEMA,
+                temperature=temperature,
+                max_tokens=4096,
+            )
+        except Exception as exc:
+            # Record a FAILED usage record so evidence failures are visible in
+            # the usage log (previously they were silently invisible).
+            if token_meter is not None:
+                latency_ms = (time.monotonic() - t0) * 1000.0
+                token_meter.record(
+                    UsageRecord(
+                        qid=parsed.qid,
+                        stage="evidence",
+                        model=config.inference_model,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=latency_ms,
+                        success=False,
+                        error=str(exc),
+                    )
+                )
+            raise  # re-raise so the outer handler runs heuristic fallback
 
         # Record usage if a meter is provided
         if token_meter is not None:
