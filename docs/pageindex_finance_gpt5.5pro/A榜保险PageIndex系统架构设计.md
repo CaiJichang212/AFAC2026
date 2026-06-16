@@ -50,7 +50,7 @@
 
 产物：
 
-- `data/processed_data/pages/{doc_id}.jsonl`
+- `data/processed_data/pages/{domain}/{doc_id}.jsonl`
 - `data/processed_data/markdown/insurance/{doc_id}.md`
 - `data/processed_data/markdown/insurance/{doc_id}.page_map.json`
 - `data/processed_data/quality/insurance_parse_quality.jsonl`
@@ -141,7 +141,7 @@ PDF -> 页级文本/OCR/版面恢复 -> 带标题层级的 Markdown -> PageIndex
 - `line_num` 不能直接当作页码使用，必须通过 `page_map` 转换。
 - Markdown 路线的索引文件应额外保存 `node_id -> source_page_range`。
 - 不直接使用 PageIndex `retrieve.py` 的 Markdown `get_page_content()` 作为正式页读取工具；该函数把 `pages` 解释为 Markdown 行号，不是 PDF 物理页码。
-- 正式答题统一从项目侧 `data/processed_data/pages/{doc_id}.jsonl` 读取 PDF 页文本。
+- 正式答题统一从项目侧 `data/processed_data/pages/{domain}/{doc_id}.jsonl` 读取 PDF 页文本。
 
 Markdown 主路必须生成节点跨度文件 `node_spans`。字段约定：
 
@@ -330,13 +330,13 @@ Markdown 主索引读取规则：
 
 - 从 `{doc_id}.json` 读取 PageIndex 树。
 - 从 `{doc_id}.node_spans.json` 读取 `node_id -> source_page_range`。
-- 从 `data/processed_data/pages/{doc_id}.jsonl` 读取 PDF 页文本。
+- 从 `data/processed_data/pages/{domain}/{doc_id}.jsonl` 读取 PDF 页文本。
 
 PDF 兜底索引读取规则：
 
 - 从 `{doc_id}.pdf_fallback.json` 读取 PageIndex 树。
 - 使用节点 `start_index/end_index` 生成页码范围。
-- 页文本仍优先读取 `data/processed_data/pages/{doc_id}.jsonl`，只在缓存缺失时才回读原始 PDF。
+- 页文本仍优先读取 `data/processed_data/pages/{domain}/{doc_id}.jsonl`，只在缓存缺失时才回读原始 PDF。
 
 ### 6.4 `TreeRetriever`
 
