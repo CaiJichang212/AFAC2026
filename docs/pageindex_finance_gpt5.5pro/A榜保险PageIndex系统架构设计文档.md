@@ -218,7 +218,8 @@ PDF 兜底索引默认采用按质量触发策略：先构建 Markdown 主索引
 ```text
 data/processed_data/
 ├── pages/
-│   └── {doc_id}.jsonl
+│   └── {domain}/
+│       └── {doc_id}.jsonl
 ├── markdown/
 │   └── insurance/
 │       ├── {doc_id}.md

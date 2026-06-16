@@ -322,12 +322,11 @@ AnswerJudge.judge(parsed: ParsedQuestion, evidence: list[EvidenceRecord], calcul
 - `node_id`
 - `title`
 - `summary` optional / nullable
-- `prefix_summary` optional / nullable
 - `page_range`
 - `nodes`
 - `index_source`
 
-即使底层索引含 `line_num`、`start_index`、`end_index` 或 `text`，在线问答模块也只能看到统一后的 `page_range`。当前默认主路关闭 `if_add_node_summary`，因此树检索不得把空的 `summary` 或 `prefix_summary` 当作检索依据；默认检索信号是 `title`、`page_range`、层级关系、保险关键词、题干和选项信号。若未来启用 summary，必须使用正式 Qwen 模型生成并记录构建 Token。
+即使底层索引含 `line_num`、`start_index`、`end_index` 或 `text`，在线问答模块也只能看到统一后的 `page_range`。当前默认主路关闭 `if_add_node_summary`，因此树检索不得把空的 `summary` 当作检索依据；默认检索信号是 `title`、`page_range`、层级关系、保险关键词、题干和选项信号。若未来启用 summary，必须使用正式 Qwen 模型生成并记录构建 Token。
 
 ### 4.5 LLM Usage And PageIndex Build Tokens
 
@@ -712,7 +711,7 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 - 页缓存总页数为 299，所有页有可抽取文本。
 - 每个文档均尝试 Markdown 主索引；主索引不合格时记录原因并触发 PDF 兜底或页级关键词降级。
 - 可用 Markdown 主索引都有 `node_spans`，所有暴露给在线模块的节点都有 PDF `page_range`。
-- 默认主索引关闭节点摘要；紧凑树中的 `summary/prefix_summary` 仅为 optional/nullable 字段，不作为默认检索依据。
+- 默认主索引关闭节点摘要；紧凑树中的 `summary` 仅为 optional/nullable 字段，不作为默认检索依据。
 - `doc_catalog.jsonl` 覆盖 16 个 `doc_id`，且能校验 A 榜题目中的 `doc_ids`。
 
 问答链路：
