@@ -232,7 +232,7 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, config: Any, *, force_mock: bool = False) -> "LLMClient":
+    def from_config(cls, config: Any, *, force_mock: bool = False, max_retries: int = 3) -> "LLMClient":
         """Build a client from an AgentConfig instance.
 
         When *force_mock* is False and an API key is available, a real
@@ -247,13 +247,13 @@ class LLMClient:
                     "No API key found (env var %s); falling back to skeleton mock caller.",
                     key_env,
                 )
-            return cls(model=getattr(config, "inference_model", "ark-code-latest"))
+            return cls(model=getattr(config, "inference_model", "ark-code-latest"), max_retries=max_retries)
 
         caller = LitellmApiCaller(
             base_url=getattr(config, "inference_base_url", ""),
             api_key=api_key,
         )
-        return cls(model=getattr(config, "inference_model", "ark-code-latest"), api_caller=caller)
+        return cls(model=getattr(config, "inference_model", "ark-code-latest"), api_caller=caller, max_retries=max_retries)
 
     # ------------------------------------------------------------------
     # Public API
@@ -280,8 +280,10 @@ class LLMClient:
         """
         kwargs: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
         if json_schema is not None:
-            kwargs["response_format"] = {"type": "json_object"}
-            # Store schema for post-hoc validation
+            # NOTE: response_format={"type": "json_object"} is NOT sent because
+            # the ARK coding model (ark-code-latest) rejects it with a 400 error.
+            # Prompt-level instructions already ask for JSON output, and
+            # _json_schema is still used for post-hoc validation in _do_call.
             kwargs["_json_schema"] = json_schema
 
         return self._call_with_retry(messages=messages, **kwargs)

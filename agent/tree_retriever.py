@@ -16,7 +16,8 @@ from agent.config import AgentConfig
 from agent.domain_profiles import DomainProfile
 from agent.index_store import _flatten_tree, _parse_page_range
 from agent.llm_client import LLMClient, NonRetryableError
-from agent.schemas import CandidateNode, ParsedQuestion
+from agent.schemas import CandidateNode, ParsedQuestion, UsageRecord
+from agent.token_meter import TokenMeter
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,7 @@ class TreeRetriever:
         profile: DomainProfile,
         *,
         llm_client: LLMClient | None = None,
+        token_meter: TokenMeter | None = None,
     ) -> list[CandidateNode]:
         """Retrieve candidate nodes for *parsed* question from *compact_tree*.
 
@@ -236,6 +238,20 @@ class TreeRetriever:
                     temperature=0.6,
                     max_tokens=2048,
                 )
+                # Record usage if a meter is provided
+                if token_meter is not None:
+                    token_meter.record(
+                        UsageRecord(
+                            qid=parsed.qid,
+                            stage="tree_retrieval",
+                            model=response.model or config.inference_model,
+                            prompt_tokens=response.prompt_tokens,
+                            completion_tokens=response.completion_tokens,
+                            total_tokens=response.total_tokens,
+                            latency_ms=response.latency_ms,
+                            success=True,
+                        )
+                    )
                 parsed_response = json.loads(response.content)
                 llm_nodes = parsed_response.get("nodes", [])
                 for item in llm_nodes:
