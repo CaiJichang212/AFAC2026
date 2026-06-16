@@ -33,6 +33,15 @@ class ParsedQuestion:
     liability_signals: list[str] = field(default_factory=list)
     number_conditions: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def stem_number_conditions(self) -> list[dict[str, Any]]:
+        """Number conditions extracted from the question stem only.
+
+        Useful for calculation engines that need stem inputs but NOT
+        candidate-answer numbers from options.
+        """
+        return [c for c in self.number_conditions if c.get("source") == "stem"]
+
 
 # ---------------------------------------------------------------------------
 # Retrieval candidates

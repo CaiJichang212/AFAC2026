@@ -133,6 +133,108 @@ def test_ins_a_001_number_conditions_premium_and_cash_value(all_parsed):
     assert cv_cond["kind"] == "cash_value"
 
 
+def test_ins_a_001_number_conditions_source_tagging(all_parsed):
+    """ins_a_001 stem conditions have source=='stem'; option numbers have source starting with 'option'."""
+    q = all_parsed[0]
+    assert q.qid == "ins_a_001"
+
+    # --- Stem conditions: 已交保费 and 现金价值 must be tagged 'stem' ---
+    stem_conds = [c for c in q.number_conditions if c.get("source") == "stem"]
+    # There should be at least the 已交保费 and 现金价值 conditions from the stem
+    stem_subjects = {c["subject"] for c in stem_conds}
+    assert "已交保费" in stem_subjects
+    assert "现金价值" in stem_subjects
+
+    # Verify 已交保费=1,000,000 and 现金价值=800,000 are among stem conditions
+    premium_stem = [
+        c for c in stem_conds
+        if c["subject"] == "已交保费" and c["value"] == 1_000_000
+    ]
+    assert len(premium_stem) >= 1
+    cv_stem = [
+        c for c in stem_conds
+        if c["subject"] == "现金价值" and c["value"] == 800_000
+    ]
+    assert len(cv_stem) >= 1
+
+    # --- Option conditions: 90万/144万 values appear in option text ---
+    option_conds = [c for c in q.number_conditions if c.get("source", "").startswith("option")]
+    option_values = {c["value"] for c in option_conds}
+    assert 900_000 in option_values   # 90万
+    assert 1_440_000 in option_values  # 144万
+
+    # All option sources should follow pattern "option_<LETTER>"
+    for c in option_conds:
+        src = c.get("source", "")
+        assert src.startswith("option_"), f"Expected source like 'option_A', got {src!r}"
+
+    # --- Overall: at least some stem conditions and some option conditions ---
+    assert len(stem_conds) > 0
+    assert len(option_conds) > 0
+
+
+def test_ins_a_007_percent_values_are_ratio_kinds(all_parsed):
+    """ins_a_007: 80% values must be ratio-like kinds (NOT cash_value), unit='%'."""
+    q = all_parsed[6]
+    assert q.qid == "ins_a_007"
+
+    # Monetary kinds that must NOT appear for % values
+    _MONETARY_KINDS = {
+        "cash_value", "account_value", "basic_sum_insured", "premium_paid",
+        "annuity_received", "amount", "deductible", "total_expense",
+        "sum_insured", "premium", "account_return", "medical_reimbursement",
+        "out_of_pocket", "payout_limit", "medical_expense",
+        "hospitalization_expense", "payout", "surrender_value",
+    }
+    # Ratio-compatible kinds allowed for %
+    _ALLOWED_PCT_KINDS = {"ratio", "surrender_charge", "payout_ratio"}
+
+    pct_conds = [c for c in q.number_conditions if c["unit"] == "%"]
+    assert len(pct_conds) >= 2  # at least the two 80% from options A and B
+
+    for nc in pct_conds:
+        assert nc["unit"] == "%"
+        assert nc["kind"] not in _MONETARY_KINDS, \
+            f"% unit got monetary kind {nc['kind']!r} — should be ratio-like"
+        assert nc["kind"] in _ALLOWED_PCT_KINDS, \
+            f"% unit got kind {nc['kind']!r}, expected one of {_ALLOWED_PCT_KINDS}"
+        assert nc["value"] == 80
+        # Source should be 'option' (not stem, since stem has no %)
+        assert nc.get("source", "").startswith("option"), \
+            f"Expected option source for ins_a_007 80%, got {nc.get('source')!r}"
+
+
+def test_stem_number_conditions_property(parser, profile):
+    """ParsedQuestion.stem_number_conditions filters to source=='stem' only."""
+    raw = {
+        "qid": "synth_011",
+        "domain": "insurance",
+        "split": "A",
+        "question": "已交保费100万元，现金价值80万元。",
+        "options": {"A": "赔付90万元", "B": "赔付144万元"},
+        "answer_format": "mcq",
+        "type": "计算题",
+        "doc_ids": ["1"],
+    }
+    pq = parser.parse(raw, profile)
+
+    # Full number_conditions includes both stem and option
+    all_sources = {c.get("source") for c in pq.number_conditions}
+    assert "stem" in all_sources
+    assert any(s.startswith("option") for s in all_sources)
+
+    # stem_number_conditions property filters to stem only
+    stem_only = pq.stem_number_conditions
+    assert len(stem_only) >= 2  # 已交保费 + 现金价值
+    for nc in stem_only:
+        assert nc.get("source") == "stem"
+
+    # Verify the stem values are correct
+    stem_values = {(c["subject"], c["value"]) for c in stem_only}
+    assert ("已交保费", 1_000_000) in stem_values
+    assert ("现金价值", 800_000) in stem_values
+
+
 def test_ins_a_001_number_conditions_has_extra_amounts(all_parsed):
     """ins_a_001 also captures other amounts from stem + options."""
     q = all_parsed[0]
@@ -332,7 +434,7 @@ def test_convenience_parse_questions_function(profile):
 
 
 def test_number_conditions_have_required_keys(parser, profile):
-    """Every number_condition record has kind, value, unit, subject, snippet."""
+    """Every number_condition record has kind, value, unit, subject, snippet, source."""
     raw = {
         "qid": "synth_010",
         "domain": "insurance",
@@ -350,6 +452,7 @@ def test_number_conditions_have_required_keys(parser, profile):
         assert "unit" in nc
         assert "subject" in nc
         assert "snippet" in nc
+        assert "source" in nc
 
 
 def test_ins_a_002_number_conditions(all_parsed):

@@ -73,6 +73,12 @@ _CLASSIFIERS: list[tuple[str, str, str]] = [
 # Context window (characters before the number) used for classification
 _CONTEXT_WINDOW = 25
 
+# ---------------------------------------------------------------------------
+# Ratio-compatible kinds — % units may ONLY use these kinds (never monetary)
+# ---------------------------------------------------------------------------
+
+_RATIO_KINDS: frozenset[str] = frozenset({"ratio", "surrender_charge", "payout_ratio"})
+
 
 class QuestionParser:
     """Parse raw question dicts into ``ParsedQuestion`` with structured signals.
@@ -113,7 +119,17 @@ class QuestionParser:
         mentioned_products = self._extract_mentioned_products(full_text, profile)
         doc_product_map = self._build_doc_product_map(doc_ids, profile)
         liability_signals = self._extract_liability_signals(full_text, profile)
-        number_conditions = self._extract_number_conditions(full_text)
+
+        # Extract number conditions from stem and each option separately
+        # so each record carries a 'source' tag (stem vs option_<LETTER>).
+        number_conditions: list[dict[str, Any]] = []
+        number_conditions.extend(
+            self._extract_number_conditions(question, source="stem")
+        )
+        for letter, text in options.items():
+            number_conditions.extend(
+                self._extract_number_conditions(text, source=f"option_{letter}")
+            )
 
         return ParsedQuestion(
             qid=qid,
@@ -216,7 +232,9 @@ class QuestionParser:
     # Number condition extraction
     # ------------------------------------------------------------------
 
-    def _extract_number_conditions(self, text: str) -> list[dict[str, Any]]:
+    def _extract_number_conditions(
+        self, text: str, source: str = "stem"
+    ) -> list[dict[str, Any]]:
         """Extract structured numeric conditions from *text*.
 
         Scans for numbers with Chinese units (万元, 万, 元, %, 岁), classifies
@@ -228,6 +246,7 @@ class QuestionParser:
             unit: str      — base unit (元, %, 岁)
             subject: str   — what the number refers to (e.g. "已交保费")
             snippet: str   — raw text around the match for inspection
+            source: str    — origin of the text: "stem" or "option_<LETTER>"
         """
         conditions: list[dict[str, Any]] = []
         seen: set[tuple[int, int]] = set()  # (start, end) spans already captured
@@ -265,6 +284,7 @@ class QuestionParser:
                         "unit": unit,
                         "subject": subject,
                         "snippet": snippet,
+                        "source": source,
                     }
                 )
 
@@ -305,6 +325,11 @@ class QuestionParser:
                     best_subject = subject
 
         if best_kind is not None:
+            # Fix: % units must never be classified as a monetary kind
+            if unit == "%" and best_kind not in _RATIO_KINDS:
+                # Keep the subject so we know what the ratio is OF,
+                # but replace the kind with 'ratio'
+                return "ratio", best_subject
             return best_kind, best_subject
 
         # Fallback: classify by unit alone
