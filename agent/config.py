@@ -99,6 +99,11 @@ class AgentConfig:
         """Parse quality JSONL file for this domain."""
         return self.quality_dir / f"{self.domain}_parse_quality.jsonl"
 
+    @property
+    def index_quality_path(self) -> Path:
+        """Index quality JSONL file for this domain."""
+        return self.quality_dir / f"{self.domain}_index_quality.jsonl"
+
     # ------------------------------------------------------------------------
     # Factory helpers
     # ------------------------------------------------------------------------

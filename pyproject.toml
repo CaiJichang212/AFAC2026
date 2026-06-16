@@ -22,3 +22,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["agent*", "scripts*", "tests*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require real data artifacts from prior pipeline tasks",
+]

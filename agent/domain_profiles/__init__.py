@@ -43,6 +43,7 @@ class DomainProfile:
     liability_terms: list[str] = field(default_factory=list)
     calculation_patterns: list[dict[str, Any]] = field(default_factory=list)
     quality_thresholds: dict[str, Any] = field(default_factory=dict)
+    doc_product_map: dict[int, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ INSURANCE_PROFILE = DomainProfile(
     liability_terms=_insurance.LIABILITY_TERMS,
     calculation_patterns=_insurance.CALCULATION_PATTERNS,
     quality_thresholds=_insurance.QUALITY_THRESHOLDS,
+    doc_product_map=_insurance.DOC_PRODUCT_MAP,
 )
 
 # ---------------------------------------------------------------------------
