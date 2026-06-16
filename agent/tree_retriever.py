@@ -254,7 +254,7 @@ class TreeRetriever:
                         ],
                         json_schema=_LLM_JSON_SCHEMA,
                         temperature=0.6,
-                        max_tokens=2048,
+                        max_tokens=config.tree_max_tokens,
                     )
                     # Record usage if a meter is provided
                     if token_meter is not None:

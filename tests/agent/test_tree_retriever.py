@@ -815,3 +815,36 @@ def test_retrieve_budget_exhausted_falls_back_to_prescreen() -> None:
     # Results come from rule prescreen
     assert len(result) >= 1
     assert all(c.reason == "rule prescreen" for c in result)
+
+
+# ======================================================================
+# Phase C: tree_max_tokens from config
+# ======================================================================
+
+
+def test_retrieve_uses_config_tree_max_tokens() -> None:
+    """Tree retrieval passes config.tree_max_tokens to llm_client.chat."""
+    profile = get_profile("insurance")
+    config = AgentConfig(tree_max_tokens=7777)
+    parsed = _make_parsed_question()
+
+    # Large tree so LLM is called
+    specs: list[tuple[str, str, str, list | None]] = [
+        ("n1", "身故保险金", "1-2", None),
+    ]
+    for i in range(15):
+        specs.append((f"extra{i}", f"附加条款{i}", "3", None))
+    tree = _make_synthetic_compact_tree(specs)
+    assert len(_flatten_tree(tree)) >= 13  # large tree
+
+    mock = MockApiCaller(responses=[_make_canned_llm_response(["n1"])])
+    llm_client = LLMClient(model="mock", api_caller=mock)
+
+    retriever = TreeRetriever()
+    retriever.retrieve(parsed, "1", tree, config, profile, llm_client=llm_client)
+
+    assert len(mock.calls) >= 1, "Expected at least one LLM call"
+    actual_max_tokens = mock.calls[0]["kwargs"].get("max_tokens")
+    assert actual_max_tokens == 7777, (
+        f"Expected max_tokens=7777 from config, got {actual_max_tokens}"
+    )

@@ -16,6 +16,7 @@ from agent.config import AgentConfig
 from agent.evidence_extractor import (
     _ALL_OPTIONS,
     _EVIDENCE_JSON_SCHEMA,
+    _build_evidence_messages,
     _normalize_whitespace,
     EvidenceExtractor,
 )
@@ -1457,6 +1458,74 @@ class TestEvidenceExtraction:
         for rec in records:
             assert rec.evidence_type in ("support", "refute", "unclear")
             assert rec.confidence in ("high", "medium", "low")
+
+
+    # ------------------------------------------------------------------
+    # Phase C: compact JSON prompt
+    # ------------------------------------------------------------------
+
+    def test_evidence_prompt_instructs_compact_json(self) -> None:
+        """The system prompt demands short quotes (<=80 chars), short facts
+        (<=40 chars), and only-JSON output with no markdown fences."""
+        messages = _build_evidence_messages(
+            question="测试问题",
+            options={"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+            page_text="测试页面内容",
+            doc_id="1",
+            node_title="测试节点",
+        )
+        system = messages[0]["content"]
+        # Quote length instruction
+        assert "≤80" in system or "80字" in system, (
+            f"System prompt should cap quote length, got: {system}"
+        )
+        # Normalized fact length instruction
+        assert "≤40" in system or "40字" in system, (
+            f"System prompt should cap normalized_fact length, got: {system}"
+        )
+        # Only-JSON / no-markdown-fences instruction
+        assert "只输出 JSON" in system or "不要加 markdown" in system or "不要加任何解释" in system, (
+            f"System prompt should demand JSON-only output, got: {system}"
+        )
+        # Numbers constraint
+        assert "0-2" in system, (
+            f"System prompt should constrain numbers to 0-2 entries, got: {system}"
+        )
+
+    # ------------------------------------------------------------------
+    # Phase C: max_tokens from config
+    # ------------------------------------------------------------------
+
+    def test_extract_from_node_llm_uses_config_evidence_max_tokens(self) -> None:
+        """_extract_from_node_llm passes config.evidence_max_tokens to llm_client.chat."""
+        extractor = EvidenceExtractor()
+        parsed = _make_parsed_question()
+        candidate = _make_candidate()
+
+        mock = MockApiCaller(responses=[_make_canned_evidence_response(_make_support_verdicts())])
+        llm_client = LLMClient(model="mock", api_caller=mock)
+
+        config = AgentConfig(evidence_max_tokens=9999)
+
+        with patch.object(
+            IndexStore, "get_page_content", return_value=[
+                _make_page_text(6, PAGE_6_TEXT),
+            ]
+        ):
+            extractor._extract_from_node_llm(
+                parsed=parsed,
+                candidate=candidate,
+                full_text=PAGE_6_TEXT,
+                config=config,
+                llm_client=llm_client,
+                token_meter=None,
+            )
+
+        assert len(mock.calls) >= 1, "Expected at least one LLM call"
+        actual_max_tokens = mock.calls[0]["kwargs"].get("max_tokens")
+        assert actual_max_tokens == 9999, (
+            f"Expected max_tokens=9999 from config, got {actual_max_tokens}"
+        )
 
 
 # ===========================================================================

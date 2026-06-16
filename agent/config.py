@@ -53,7 +53,14 @@ class AgentConfig:
     # -- per-question LLM-call budget (Phase B) --------------------------------
     max_llm_calls_per_question: int = 12
 
-    # -- max_tokens for LLM stages (Phase C ready; read by tree/evidence) ------
+    # -- max_tokens for LLM stages (Phase C) ----------------------------------
+    # IMPORTANT: ark-code-latest is a REASONING model.  It needs max_tokens
+    # large enough to cover both the reasoning budget (~4500 tokens) and the
+    # content output — hence the 8192 / 4096 defaults.  For a NON-reasoning
+    # Qwen model at final submission these can be lowered (e.g. 1536 / 1024)
+    # via config or env.  We are NOT lowering below the reasoning budget for
+    # ark — the compactness win comes from shorter OUTPUT (achieved via the
+    # evidence prompt), not by starving the reasoning budget.
     evidence_max_tokens: int = 8192
     tree_max_tokens: int = 4096
 

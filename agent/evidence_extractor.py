@@ -226,7 +226,7 @@ class EvidenceExtractor:
                 messages=messages,
                 json_schema=_EVIDENCE_JSON_SCHEMA,
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=config.evidence_max_tokens,
             )
         except Exception as exc:
             # Record a FAILED usage record so evidence failures are visible in
@@ -529,11 +529,14 @@ def _build_evidence_messages(
         "规则：\n"
         "1. 为每个选项（A、B、C、D）分别给出一个判断（verdict）。\n"
         "2. evidence_type 必须严格从以下三个值中选择：support（支持）、refute（反驳）、unclear（无法确定）。\n"
-        "3. quote 必须是页面文本中的**原文字符串**（逐字复制），不得修改或概括。如果找不到相关原文，quote 可以为空字符串。\n"
-        "4. normalized_fact 用简体中文重新表述从原文中提炼的事实。\n"
-        "5. numbers 提取页面中相关的数值信息，格式为 [{\"name\": \"名称\", \"value\": 数值, \"unit\": \"单位\"}]。\n"
+        "3. quote 必须是从页面文本中逐字复制的**简短原文片段**（≤80字），只摘录最相关的一句，不要复制整个段落。"
+        "如果找不到相关原文，quote 可以为空字符串。\n"
+        "4. normalized_fact 用简体中文简短重述从原文中提炼的事实（≤40字）。\n"
+        "5. numbers 仅在页面中有直接相关的数值信息时才提取（0-2条），格式为 "
+        "[{\"name\": \"名称\", \"value\": 数值, \"unit\": \"单位\"}]。\n"
         "6. confidence 表示判断的置信度：high（高）、medium（中）、low（低）。\n\n"
-        "请严格按照JSON格式返回，包含 verdicts 数组，每个元素为一个选项的判断。"
+        "重要：只输出 JSON 对象本身，不要加 markdown 代码围栏（```json），"
+        "不要加任何解释、前言或后记。"
     )
 
     user_prompt = (
