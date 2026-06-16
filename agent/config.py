@@ -89,6 +89,16 @@ class AgentConfig:
         """Run logs directory."""
         return self.output_dir / "logs"
 
+    @property
+    def quality_dir(self) -> Path:
+        """Parse quality logs directory."""
+        return self.processed_root / "quality"
+
+    @property
+    def quality_path(self) -> Path:
+        """Parse quality JSONL file for this domain."""
+        return self.quality_dir / f"{self.domain}_parse_quality.jsonl"
+
     # ------------------------------------------------------------------------
     # Factory helpers
     # ------------------------------------------------------------------------
