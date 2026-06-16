@@ -508,18 +508,9 @@ class TestRunAll:
         index_store = _make_index_store_mock()
         token_meter = TokenMeter(logs_dir=config.logs_dir)
 
-        # Craft mock responses for tree_retrieval + evidence extraction
-        # Return 2 nodes to avoid the node-insufficient fallback (< 2 triggers retry)
-        tree_response = {
-            "choices": [{"message": {"content": json.dumps({
-                "nodes": [
-                    {"node_id": "n1", "reason": "relevant to death benefit"},
-                    {"node_id": "n1.1", "reason": "calculation formula"},
-                ]
-            })}}],
-            "model": "mock",
-            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
-        }
+        # Craft mock responses: tree is small (3 nodes) so tree_retrieval
+        # LLM is skipped (Phase B). Only need evidence responses.
+        # Return 2 evidence responses for 2 candidate nodes.
         evidence_response = {
             "choices": [{"message": {"content": json.dumps({
                 "verdicts": [
@@ -557,7 +548,7 @@ class TestRunAll:
             "usage": {"prompt_tokens": 200, "completion_tokens": 100, "total_tokens": 300},
         }
 
-        mock_caller = MockApiCaller(responses=[tree_response, evidence_response])
+        mock_caller = MockApiCaller(responses=[evidence_response, evidence_response])
         llm_client = LLMClient(model="mock", api_caller=mock_caller)
 
         parsed = _make_parsed_question()
@@ -582,16 +573,16 @@ class TestRunAll:
         assert len(support_opts) >= 1, f"No support evidence found; evidence types: {[e.evidence_type for e in record.evidence]}"
 
         # Usage should be recorded for all stages
-        # 1 tree_retrieval + 2 evidence (one per candidate node) = 3 calls
-        assert token_meter.record_count >= 3
+        # Small tree (3 nodes) -> tree retrieval skipped (prescreen),
+        # only 2 evidence calls (one per candidate node)
+        assert token_meter.record_count >= 2
         stages = {r.stage for r in token_meter._records}
-        assert "tree_retrieval" in stages
         assert "evidence" in stages
 
         # Per-qid usage should aggregate all stages
         qid_usage = _qid_usage(token_meter, "ins_a_001")
-        # 150 (tree) + 300 (evidence n1) + 300 (evidence n1.1) = 750
-        assert qid_usage["total_tokens"] == 750
+        # 300 (evidence n1) + 300 (evidence n1.1) = 600
+        assert qid_usage["total_tokens"] == 600
 
     def test_run_all_with_canned_responses_valid_outputs(self, tmp_path: Path) -> None:
         """run_all with canned responses produces answer.csv that passes validation."""
@@ -604,18 +595,9 @@ class TestRunAll:
         index_store = _make_index_store_mock()
         token_meter = TokenMeter(logs_dir=config.logs_dir)
 
-        # Build enough canned responses for 3 questions (2 calls each = 6)
-        # Return 2 nodes to avoid the node-insufficient fallback (< 2 triggers retry)
-        tree_resp = {
-            "choices": [{"message": {"content": json.dumps({
-                "nodes": [
-                    {"node_id": "n1", "reason": "match"},
-                    {"node_id": "n1.1", "reason": "formula"},
-                ]
-            })}}],
-            "model": "mock",
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        }
+        # Build enough canned responses for 3 questions.
+        # Small tree (3 nodes) -> tree retrieval skipped, only 2 evidence
+        # calls per question. Total: 3 questions * 2 = 6 responses.
         evidence_resp = {
             "choices": [{"message": {"content": json.dumps({
                 "verdicts": [
@@ -634,11 +616,10 @@ class TestRunAll:
             "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
         }
 
-        # Need 3 responses per question (1 tree + 2 evidence for 2 candidates)
-        # for 3 questions = 9 responses total
+        # Need 2 responses per question (2 evidence calls for 2 candidates)
+        # for 3 questions = 6 responses total
         responses = []
         for _ in range(3):
-            responses.append(tree_resp)
             responses.append(evidence_resp)
             responses.append(evidence_resp)  # second evidence call per question
 
@@ -673,9 +654,9 @@ class TestRunAll:
         row_sum = sum(int(r["total_tokens"]) for r in csv_rows[1:])
         assert summary_total == row_sum
 
-        # Each question total_tokens should be 75 (15 tree + 30 ev + 30 ev)
+        # Each question total_tokens should be 60 (30 ev + 30 ev, tree skipped for small tree)
         for row in csv_rows[1:]:
-            assert int(row["total_tokens"]) == 75
+            assert int(row["total_tokens"]) == 60
 
         # Validate against questions
         questions_raw = [
@@ -798,3 +779,266 @@ class TestPipelineEdgeCases:
         # Must be JSON-serializable
         json_str = json.dumps(d, ensure_ascii=False)
         assert isinstance(json_str, str)
+
+
+# ===========================================================================
+# Phase B: targeted retry + call budget
+# ===========================================================================
+
+
+class TestPhaseBTargetedRetry:
+    """Tests for Phase B targeted retry (no full re-extract)."""
+
+    def test_targeted_retry_uses_smaller_candidate_set(self) -> None:
+        """Evidence-insufficient fallback re-extracts only top 2 nodes, not all."""
+        config = AgentConfig(max_retry_per_question=1)
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+
+        # Build a tree where 4 nodes match keywords so we get >= 2 candidates,
+        # avoiding the node-insufficient fallback.
+        from unittest.mock import MagicMock
+        from agent.index_store import PageText
+        index_store = MagicMock()
+        index_store.get_document_structure.return_value = [
+            {
+                "node_id": "n1",
+                "title": "身故保险金",
+                "page_range": "6-8",
+                "nodes": [
+                    {"node_id": "n1.1", "title": "保险责任", "page_range": "6-7"},
+                    {"node_id": "n1.2", "title": "责任免除", "page_range": "8"},
+                    {"node_id": "n1.3", "title": "释义", "page_range": "9"},
+                ],
+            },
+        ]
+        index_store.get_page_content.return_value = [
+            PageText(doc_id="1", page=6, text="条款内容。"),
+            PageText(doc_id="1", page=7, text="更多内容。"),
+            PageText(doc_id="1", page=8, text="免责内容。"),
+            PageText(doc_id="1", page=9, text="释义内容。"),
+        ]
+        token_meter = TokenMeter()
+
+        # Craft evidence responses that are all "unclear" — no support for any
+        # answer, which triggers the evidence-insufficient fallback.
+        unclear_evidence = {
+            "choices": [{"message": {"content": json.dumps({
+                "verdicts": [
+                    {"option": "A", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "B", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "C", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "D", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                ]
+            })}}],
+            "model": "mock",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        # Small tree (4 nodes) -> tree retrieval LLM skipped.
+        # 4 candidates -> 4 original evidence calls.
+        # Fallback: 2 widened top nodes -> 2 more evidence calls.
+        # Total: 6 evidence responses needed.
+        responses = [unclear_evidence] * 6
+        mock_caller = MockApiCaller(responses=responses)
+        llm_client = LLMClient(model="mock", api_caller=mock_caller)
+
+        parsed = _make_parsed_question()
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=llm_client,
+            token_meter=token_meter,
+        )
+
+        # The targeted retry fallback should be recorded
+        assert "evidence_insufficient_targeted_retry" in record.fallbacks, (
+            f"Expected targeted_retry in fallbacks, got {record.fallbacks}"
+        )
+
+        # Total LLM calls: 4 (original evidence) + 2 (targeted retry on top 2)
+        # = 6 evidence calls. No tree calls (small tree skipped).
+        # This is fewer than the old full re-extract which would be 4+4=8.
+        assert len(mock_caller.calls) == 6, (
+            f"Expected 6 LLM calls (4 original + 2 retry), got {len(mock_caller.calls)}"
+        )
+
+    def test_retry_disabled_by_max_retries_zero(self) -> None:
+        """With max_retry_per_question=0, no retry fallback triggers."""
+        config = AgentConfig(max_retry_per_question=0)
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+
+        # Build a tree with enough keyword-matching nodes to avoid
+        # node-insufficient triggering first.
+        from unittest.mock import MagicMock
+        from agent.index_store import PageText
+        index_store = MagicMock()
+        index_store.get_document_structure.return_value = [
+            {
+                "node_id": "n1", "title": "身故保险金", "page_range": "6-8",
+                "nodes": [
+                    {"node_id": "n1.1", "title": "保险责任", "page_range": "6-7"},
+                    {"node_id": "n1.2", "title": "责任免除", "page_range": "8"},
+                ],
+            },
+        ]
+        index_store.get_page_content.return_value = [
+            PageText(doc_id="1", page=6, text="条款内容。"),
+            PageText(doc_id="1", page=7, text="更多内容。"),
+            PageText(doc_id="1", page=8, text="免责内容。"),
+        ]
+        token_meter = TokenMeter()
+
+        unclear_evidence = {
+            "choices": [{"message": {"content": json.dumps({
+                "verdicts": [
+                    {"option": "A", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "B", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "C", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "D", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                ]
+            })}}],
+            "model": "mock",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        # Only 3 responses (original evidence), no retry should happen
+        mock_caller = MockApiCaller(responses=[unclear_evidence] * 3)
+        llm_client = LLMClient(model="mock", api_caller=mock_caller)
+
+        parsed = _make_parsed_question()
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=llm_client,
+            token_meter=token_meter,
+        )
+
+        # No retry fallback with max_retry_per_question=0
+        assert "evidence_insufficient_targeted_retry" not in record.fallbacks
+        assert "node_insufficient_targeted_widen" not in record.fallbacks
+        # Only 3 evidence calls (no retry)
+        assert len(mock_caller.calls) == 3
+
+
+class TestPhaseBCallBudget:
+    """Tests for Phase B per-question LLM-call budget."""
+
+    def test_budget_exhaustion_stops_llm_and_records_marker(self) -> None:
+        """When max_llm_calls_per_question is low, budget exhaustion stops LLM."""
+        config = AgentConfig(
+            max_llm_calls_per_question=2,
+            max_retry_per_question=1,
+        )
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+
+        # Build an index store whose tree has 4 keyword-matching nodes
+        # so 4 evidence calls would be attempted, but budget=2 stops after 2.
+        from unittest.mock import MagicMock
+        from agent.index_store import PageText
+        index_store = MagicMock()
+        index_store.get_document_structure.return_value = [
+            {
+                "node_id": "n1", "title": "身故保险金", "page_range": "1-2",
+                "nodes": [
+                    {"node_id": "n1.1", "title": "保险责任", "page_range": "1"},
+                    {"node_id": "n1.2", "title": "责任免除", "page_range": "2"},
+                    {"node_id": "n1.3", "title": "释义", "page_range": "3"},
+                ],
+            },
+        ]
+        index_store.get_page_content.return_value = [
+            PageText(doc_id="1", page=1, text="条款内容"),
+            PageText(doc_id="1", page=2, text="更多条款"),
+            PageText(doc_id="1", page=3, text="免责内容"),
+        ]
+        token_meter = TokenMeter()
+
+        unclear_evidence = {
+            "choices": [{"message": {"content": json.dumps({
+                "verdicts": [
+                    {"option": "A", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "B", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "C", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                    {"option": "D", "evidence_type": "unclear", "quote": "",
+                     "normalized_fact": "", "confidence": "low"},
+                ]
+            })}}],
+            "model": "mock",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        # 2 for evidence calls, no more after budget exhausts
+        mock_caller = MockApiCaller(responses=[unclear_evidence] * 2)
+        llm_client = LLMClient(model="mock", api_caller=mock_caller)
+
+        parsed = _make_parsed_question()
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=llm_client,
+            token_meter=token_meter,
+        )
+
+        # Budget exhaustion should be recorded as a fallback marker
+        assert "llm_budget_exhausted" in record.fallbacks, (
+            f"Expected llm_budget_exhausted in fallbacks, got {record.fallbacks}"
+        )
+
+        # Only 2 LLM calls were made (budget exhausted after 2)
+        assert len(mock_caller.calls) == 2, (
+            f"Expected exactly 2 LLM calls, got {len(mock_caller.calls)}"
+        )
+
+        # Pipeline still returned a valid answer (prescreen/heuristic fallback)
+        assert record.answer in ("A", "B", "C", "D")
+        assert isinstance(record.evidence, list)
+
+    def test_budget_exhausted_pipeline_still_returns_valid_record(self) -> None:
+        """With budget=0 (immediately exhausted), pipeline returns valid AnswerRecord."""
+        config = AgentConfig(
+            max_llm_calls_per_question=0,
+            max_retry_per_question=0,
+        )
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+        index_store = _make_index_store_mock()
+        token_meter = TokenMeter()
+
+        parsed = _make_parsed_question()
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=LLMClient.from_config(config, force_mock=True),
+            token_meter=token_meter,
+        )
+
+        # Should record budget exhaustion and still produce an answer
+        assert record.qid == "ins_a_001"
+        assert record.answer in ("A", "B", "C", "D")
+        assert "llm_budget_exhausted" in record.fallbacks

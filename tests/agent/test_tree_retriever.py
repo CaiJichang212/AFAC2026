@@ -216,18 +216,22 @@ def test_retrieve_rule_fallback_with_failing_llm() -> None:
 # ======================================================================
 
 
-def test_retrieve_mocked_llm_small_tree() -> None:
-    """With a mock LLM, use its returned node_ids."""
+def test_retrieve_mocked_llm_large_tree() -> None:
+    """With a mock LLM and a large tree, LLM is called and its returned node_ids are used."""
     profile = get_profile("insurance")
     config = AgentConfig()
     parsed = _make_parsed_question()
 
-    tree = _make_synthetic_compact_tree([
-        ("n1", "身故保险金的计算方式", "1-2", None),
-        ("n2", "保险责任概述", "3", None),
-        ("n3", "责任免除条款", "4", None),
-        ("n4", "释义", "5", None),
-    ])
+    # Build a large tree (>12 nodes) so the LLM path is still exercised
+    specs: list[tuple[str, str, str, list | None]] = [
+        ("n1", "保险责任", "1", None),
+        ("n2", "责任免除", "2", None),
+        ("n3", "释义", "3", None),
+    ]
+    for i in range(10):
+        specs.append((f"extra{i}", f"附加条款{i}", f"{4+i}", None))
+    tree = _make_synthetic_compact_tree(specs)
+    assert len(_flatten_tree(tree)) == 13  # large tree
 
     llm_client = _make_mock_llm_client(
         node_ids=["n2", "n3"],
@@ -241,14 +245,13 @@ def test_retrieve_mocked_llm_small_tree() -> None:
     assert result[0].node_id == "n2"
     assert result[0].reason == "matches insurance liability"
     assert result[0].doc_id == "1"
-    assert result[0].page_range == "3"
+    assert result[0].page_range == "2"
     assert result[0].needs_page_fetch is True
     # matched_signals from prescreen still populated
-    assert "keyword:保险责任" in result[0].matched_signals
+    assert "keyword:保险责任" not in str(result[0].matched_signals)  # n2 has 责任免除
 
     assert result[1].node_id == "n3"
     assert result[1].reason == "covers exclusion clauses"
-    assert "keyword:责任免除" in result[1].matched_signals
 
 
 def test_retrieve_node_cap_at_5() -> None:
@@ -391,8 +394,8 @@ def test_retrieve_large_tree_sends_only_prescreened_to_llm() -> None:
         )
 
 
-def test_retrieve_small_tree_sends_whole_tree_to_llm() -> None:
-    """When tree has <=12 nodes, the entire tree is in the LLM prompt."""
+def test_retrieve_small_tree_skips_llm() -> None:
+    """Phase B: when tree has <=12 nodes, skip LLM entirely and use rule prescreen."""
     profile = get_profile("insurance")
     config = AgentConfig()
     parsed = _make_parsed_question()
@@ -409,12 +412,11 @@ def test_retrieve_small_tree_sends_whole_tree_to_llm() -> None:
     retriever = TreeRetriever()
     result = retriever.retrieve(parsed, "1", tree, config, profile, llm_client=llm_client)
 
-    assert len(result) == 2
-    # All nodes should be in the prompt
-    user_content = mock.calls[0]["messages"][1]["content"]
-    assert "保险责任" in user_content
-    assert "责任免除" in user_content
-    assert "释义" in user_content
+    # Small tree: LLM should NOT have been called
+    assert len(mock.calls) == 0, f"Expected 0 LLM calls for small tree, got {len(mock.calls)}"
+    # Results come from rule prescreen
+    assert len(result) >= 1
+    assert all(c.reason == "rule prescreen" for c in result)
 
 
 # ======================================================================
@@ -423,7 +425,7 @@ def test_retrieve_small_tree_sends_whole_tree_to_llm() -> None:
 
 
 def test_retrieve_no_line_num_or_text_in_output() -> None:
-    """CandidateNode and LLM prompt must not contain line_num or text keys."""
+    """CandidateNode output must not contain line_num or text keys."""
     profile = get_profile("insurance")
     config = AgentConfig()
     parsed = _make_parsed_question()
@@ -453,12 +455,9 @@ def test_retrieve_no_line_num_or_text_in_output() -> None:
     found = all_keys & forbidden
     assert not found, f"Tree should not contain forbidden keys, found: {found}"
 
-    # Run retrieval
-    mock = MockApiCaller(responses=[_make_canned_llm_response(["n1"])])
-    llm_client = LLMClient(model="mock", api_caller=mock)
-
+    # Small tree (1 node) -> rule prescreen, no LLM call
     retriever = TreeRetriever()
-    result = retriever.retrieve(parsed, "1", tree, config, profile, llm_client=llm_client)
+    result = retriever.retrieve(parsed, "1", tree, config, profile)
 
     assert len(result) == 1
     c = result[0]
@@ -466,12 +465,6 @@ def test_retrieve_no_line_num_or_text_in_output() -> None:
     # CandidateNode never has line_num/text
     assert not hasattr(c, "line_num")
     assert not hasattr(c, "text")
-
-    # LLM prompt should also be clean
-    user_content = mock.calls[0]["messages"][1]["content"]
-    assert "line_num" not in user_content
-    assert "start_index" not in user_content
-    assert "end_index" not in user_content
 
 
 # ======================================================================
@@ -581,7 +574,7 @@ def test_retrieve_no_matching_nodes() -> None:
 
 
 def test_retrieve_nested_tree() -> None:
-    """The retriever handles nested compact trees (nodes with children)."""
+    """The retriever handles nested compact trees (nodes with children) with LLM for large trees."""
     profile = get_profile("insurance")
     config = AgentConfig()
     parsed = _make_parsed_question()
@@ -592,7 +585,9 @@ def test_retrieve_nested_tree() -> None:
             ("n1b", "养老保险金", "2-3", None),
         ]),
         ("n2", "责任免除", "4", None),
-    ])
+    ] + [(f"extra{i}", f"附加{i}", f"{5+i}", None) for i in range(10)])
+    # 2 + 10 = 12 extra nodes + 2 (n1, n2) = 14 flat nodes -> large tree
+    assert len(_flatten_tree(tree)) >= 13
 
     llm_client = _make_mock_llm_client(node_ids=["n1a", "n1b", "n2"])
 
@@ -673,7 +668,7 @@ def test_retrieve_respects_config_budgets() -> None:
 
 
 def test_retrieve_llm_returns_nonexistent_nodes() -> None:
-    """LLM returning invalid node_ids: those are silently filtered out."""
+    """Large tree: LLM returning invalid node_ids are silently filtered out; valid kept."""
     profile = get_profile("insurance")
     config = AgentConfig()
     parsed = _make_parsed_question()
@@ -681,7 +676,8 @@ def test_retrieve_llm_returns_nonexistent_nodes() -> None:
     tree = _make_synthetic_compact_tree([
         ("n1", "保险责任", "1-2", None),
         ("n2", "责任免除", "3", None),
-    ])
+    ] + [(f"extra{i}", f"附加{i}", f"{4+i}", None) for i in range(11)])
+    assert len(_flatten_tree(tree)) >= 13  # large tree
 
     # LLM returns one valid, one invalid node_id
     llm_client = _make_mock_llm_client(node_ids=["n1", "ghost_node"])
@@ -780,3 +776,42 @@ def test_retrieve_large_tree_fallback_no_llm() -> None:
     assert result[0].node_id == "n_good"
     assert all(c.reason == "rule prescreen" for c in result)
     assert len(result) <= 5
+
+
+# ======================================================================
+# Phase B: LLM-call budget exhaustion
+# ======================================================================
+
+
+def test_retrieve_budget_exhausted_falls_back_to_prescreen() -> None:
+    """When the per-question LLM budget is exhausted, skip LLM and use prescreen."""
+    from agent.pipeline import LLMBudget
+
+    profile = get_profile("insurance")
+    config = AgentConfig()
+    parsed = _make_parsed_question()
+
+    # Large tree so LLM would normally be called
+    specs: list[tuple[str, str, str, list | None]] = [
+        ("n1", "身故保险金", "1-2", None),
+    ]
+    for i in range(15):
+        specs.append((f"extra{i}", f"附加条款{i}", "3", None))
+    tree = _make_synthetic_compact_tree(specs)
+    assert len(_flatten_tree(tree)) >= 13  # large tree
+
+    mock = MockApiCaller(responses=[_make_canned_llm_response(["n1"])])
+    llm_client = LLMClient(model="mock", api_caller=mock)
+
+    # Exhausted budget: 0 remaining calls
+    budget = LLMBudget(max_calls=0)
+
+    retriever = TreeRetriever()
+    result = retriever.retrieve(parsed, "1", tree, config, profile,
+                                llm_client=llm_client, budget=budget)
+
+    # LLM should NOT have been called (budget exhausted)
+    assert len(mock.calls) == 0, f"Expected 0 LLM calls, got {len(mock.calls)}"
+    # Results come from rule prescreen
+    assert len(result) >= 1
+    assert all(c.reason == "rule prescreen" for c in result)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agent.config import AgentConfig
 from agent.domain_profiles import DomainProfile
@@ -18,6 +18,9 @@ from agent.index_store import _flatten_tree, _parse_page_range
 from agent.llm_client import LLMClient, NonRetryableError
 from agent.schemas import CandidateNode, ParsedQuestion, UsageRecord
 from agent.token_meter import TokenMeter
+
+if TYPE_CHECKING:
+    from agent.pipeline import LLMBudget
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +177,7 @@ class TreeRetriever:
         *,
         llm_client: LLMClient | None = None,
         token_meter: TokenMeter | None = None,
+        budget: "LLMBudget | None" = None,
     ) -> list[CandidateNode]:
         """Retrieve candidate nodes for *parsed* question from *compact_tree*.
 
@@ -185,6 +189,10 @@ class TreeRetriever:
             profile: Domain profile (keywords, liability terms, product aliases).
             llm_client: Optional LLM client for refinement. If None or failing,
                 the method falls back to rule-based selection.
+            token_meter: Optional token meter for recording usage.
+            budget: Optional per-question LLM-call budget (Phase B).  When the
+                budget is exhausted the LLM is skipped and the prescreen
+                fallback is used instead.
 
         Returns:
             Up to ``config.max_nodes_per_doc`` CandidateNode instances, with
@@ -206,63 +214,73 @@ class TreeRetriever:
         max_pages = config.max_pages_per_doc
         small_tree = len(flat_nodes) <= _SMALL_TREE_NODE_LIMIT
 
-        # 3. LLM selection (if available)
+        # 3. LLM selection (Phase B: skip for small trees; respect call budget)
         selected_node_ids: list[str] = []
         reasons: dict[str, str] = {}
         llm_used: bool = False
 
-        if llm_client is not None and scored:
-            try:
-                if small_tree:
-                    # Send the whole compact tree
-                    llm_input = _build_compact_tree_for_llm(compact_tree)
-                else:
+        # Only call the LLM for LARGE trees where prescreen may be ambiguous.
+        # Small trees use rule-prescreen ranking directly (saves ~4 calls/question).
+        should_use_llm = (
+            llm_client is not None
+            and scored
+            and not small_tree
+        )
+        if should_use_llm:
+            # Check per-question LLM-call budget (Phase B)
+            if budget is not None and not budget.consume():
+                logger.info(
+                    "LLM call budget exhausted for doc %s; falling back to rule prescreen.",
+                    doc_id,
+                )
+            else:
+                try:
                     # Send only the prescreened top-K
                     top_k = self._top_k_by_score(scored, _SMALL_TREE_NODE_LIMIT * 2)
                     llm_input = _build_compact_tree_for_llm(
                         [n for n, _, _ in top_k]
                     )
 
-                prompt = _build_node_selection_prompt(
-                    parsed.question, parsed.options, llm_input, max_nodes
-                )
-                response = llm_client.chat(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": _LLM_SYSTEM_PROMPT.format(max_nodes=max_nodes),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    json_schema=_LLM_JSON_SCHEMA,
-                    temperature=0.6,
-                    max_tokens=2048,
-                )
-                # Record usage if a meter is provided
-                if token_meter is not None:
-                    token_meter.record(
-                        UsageRecord(
-                            qid=parsed.qid,
-                            stage="tree_retrieval",
-                            model=response.model or config.inference_model,
-                            prompt_tokens=response.prompt_tokens,
-                            completion_tokens=response.completion_tokens,
-                            total_tokens=response.total_tokens,
-                            latency_ms=response.latency_ms,
-                            success=True,
-                        )
+                    prompt = _build_node_selection_prompt(
+                        parsed.question, parsed.options, llm_input, max_nodes
                     )
-                parsed_response = json.loads(response.content)
-                llm_nodes = parsed_response.get("nodes", [])
-                for item in llm_nodes:
-                    nid = item.get("node_id", "")
-                    if nid and nid in node_lookup:
-                        selected_node_ids.append(nid)
-                        reasons[nid] = item.get("reason", "")
-                llm_used = True
-            except Exception as exc:
-                logger.warning("LLM node selection failed: %s; falling back to rule prescreen", exc)
-                # Fall through to fallback
+                    response = llm_client.chat(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": _LLM_SYSTEM_PROMPT.format(max_nodes=max_nodes),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        json_schema=_LLM_JSON_SCHEMA,
+                        temperature=0.6,
+                        max_tokens=2048,
+                    )
+                    # Record usage if a meter is provided
+                    if token_meter is not None:
+                        token_meter.record(
+                            UsageRecord(
+                                qid=parsed.qid,
+                                stage="tree_retrieval",
+                                model=response.model or config.inference_model,
+                                prompt_tokens=response.prompt_tokens,
+                                completion_tokens=response.completion_tokens,
+                                total_tokens=response.total_tokens,
+                                latency_ms=response.latency_ms,
+                                success=True,
+                            )
+                        )
+                    parsed_response = json.loads(response.content)
+                    llm_nodes = parsed_response.get("nodes", [])
+                    for item in llm_nodes:
+                        nid = item.get("node_id", "")
+                        if nid and nid in node_lookup:
+                            selected_node_ids.append(nid)
+                            reasons[nid] = item.get("reason", "")
+                    llm_used = True
+                except Exception as exc:
+                    logger.warning("LLM node selection failed: %s; falling back to rule prescreen", exc)
+                    # Fall through to fallback
 
         # 4. Fallback: use rule-prescreen ranking
         if not llm_used:

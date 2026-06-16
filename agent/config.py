@@ -50,6 +50,13 @@ class AgentConfig:
     max_evidence_per_option: int = 3
     max_retry_per_question: int = 1
 
+    # -- per-question LLM-call budget (Phase B) --------------------------------
+    max_llm_calls_per_question: int = 12
+
+    # -- max_tokens for LLM stages (Phase C ready; read by tree/evidence) ------
+    evidence_max_tokens: int = 8192
+    tree_max_tokens: int = 4096
+
     # ------------------------------------------------------------------------
     # Derived paths (properties)
     # ------------------------------------------------------------------------
@@ -148,6 +155,9 @@ class AgentConfig:
             "max_pages_per_doc",
             "max_evidence_per_option",
             "max_retry_per_question",
+            "max_llm_calls_per_question",
+            "evidence_max_tokens",
+            "tree_max_tokens",
         ):
             value = getattr(args, field_name, None)
             if value is not None:
@@ -219,7 +229,8 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-page-num-each-node", type=int, default=8, help="Max pages per index node")
     parser.add_argument("--max-token-num-each-node", type=int, default=20000, help="Max tokens per index node")
     parser.add_argument("--max-docs-per-question", type=int, default=4, help="Max docs per question")
-    parser.add_argument("--max-nodes-per-doc", type=int, default=5, help="Max nodes per doc")
-    parser.add_argument("--max-pages-per-doc", type=int, default=8, help="Max pages per doc")
+    parser.add_argument("--max-nodes-per-doc", type=int, default=None, help="Max nodes per doc")
+    parser.add_argument("--max-pages-per-doc", type=int, default=None, help="Max pages per doc")
     parser.add_argument("--max-evidence-per-option", type=int, default=3, help="Max evidence per option")
-    parser.add_argument("--max-retry-per-question", type=int, default=1, help="Max retries per question")
+    parser.add_argument("--max-retry-per-question", type=int, default=None, help="Max retries per question")
+    parser.add_argument("--max-llm-calls-per-question", type=int, default=None, help="Max LLM calls per question")

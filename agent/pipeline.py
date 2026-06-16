@@ -30,6 +30,55 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Per-question LLM-call budget (Phase B)
+# ---------------------------------------------------------------------------
+
+
+class LLMBudget:
+    """Tracks LLM calls made for a single question against a hard cap.
+
+    Shared across all stages within one ``run_question`` invocation so that
+    tree retrieval, evidence extraction, and any retries all draw from the
+    same pool.  When the budget is exhausted, stages MUST fall back to their
+    deterministic / heuristic paths.
+    """
+
+    def __init__(self, max_calls: int) -> None:
+        if max_calls < 0:
+            raise ValueError("max_calls must be >= 0")
+        self._max: int = max_calls
+        self._count: int = 0
+
+    # -- queries -----------------------------------------------------------
+
+    @property
+    def exhausted(self) -> bool:
+        """True when no more LLM calls are allowed."""
+        return self._count >= self._max
+
+    @property
+    def calls_made(self) -> int:
+        return self._count
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self._max - self._count)
+
+    # -- mutation ----------------------------------------------------------
+
+    def consume(self) -> bool:
+        """Try to allocate one LLM-call slot.
+
+        Returns True if the slot was granted; False if the budget is already
+        exhausted (caller MUST fall back to a non-LLM path).
+        """
+        if self._count >= self._max:
+            return False
+        self._count += 1
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Page-range widening helper
 # ---------------------------------------------------------------------------
 
@@ -101,6 +150,18 @@ def run_question(
     fallbacks: list[str] = []
     all_warnings: list[str] = []
 
+    # Per-question LLM-call budget (Phase B)
+    budget = LLMBudget(max_calls=config.max_llm_calls_per_question)
+    _budget_exhausted_recorded: bool = False
+
+    def _check_budget() -> bool:
+        """Return True if budget still has room; record marker on first exhaustion."""
+        nonlocal _budget_exhausted_recorded
+        if budget.exhausted and not _budget_exhausted_recorded:
+            _budget_exhausted_recorded = True
+            fallbacks.append("llm_budget_exhausted")
+        return not budget.exhausted
+
     # ------------------------------------------------------------------
     # Stage 1: Document retrieval (A-split passthrough)
     # ------------------------------------------------------------------
@@ -144,6 +205,7 @@ def run_question(
                 profile,
                 llm_client=llm_client,
                 token_meter=token_meter,
+                budget=budget,
             )
         except Exception as exc:
             logger.warning("Tree retrieval failed for doc %s (qid=%s): %s",
@@ -158,27 +220,34 @@ def run_question(
     # ------------------------------------------------------------------
     evidence = _extract_evidence(
         parsed, all_candidates, index_store, config,
-        evidence_extractor, llm_client, token_meter,
+        evidence_extractor, llm_client, token_meter, budget,
     )
 
+    # Record budget exhaustion if the budget was consumed during extraction
+    _check_budget()
+
     # ------------------------------------------------------------------
-    # Fallback: node-insufficient
+    # Fallback: node-insufficient (Phase B: targeted widen, not full re-extract)
     # ------------------------------------------------------------------
     total_pages = sum(_count_pages_in_range(c.page_range) for c in all_candidates)
     if (len(all_candidates) < 2 or total_pages < 3):
-        if retry_count < max_retries and all_candidates:
+        if retry_count < max_retries and all_candidates and _check_budget():
             logger.info(
-                "Node-insufficient for %s (%d candidates, %d pages); widening.",
+                "Node-insufficient for %s (%d candidates, %d pages); targeted widen.",
                 parsed.qid, len(all_candidates), total_pages,
             )
-            fallbacks.append("node_insufficient_widen")
-            widened = _widen_candidates(all_candidates, by=2)
-            evidence_retry = _extract_evidence(
-                parsed, widened, index_store, config,
-                evidence_extractor, llm_client, token_meter,
-            )
-            if evidence_retry:
-                evidence = evidence_extractor._dedup(evidence + evidence_retry)
+            fallbacks.append("node_insufficient_targeted_widen")
+            # Targeted: widen only the top 2 candidates (by retrieval order)
+            # rather than the full candidate set.
+            top_nodes = all_candidates[:2]
+            widened_top = _widen_candidates(top_nodes, by=1)
+            if widened_top:
+                evidence_retry = _extract_evidence(
+                    parsed, widened_top, index_store, config,
+                    evidence_extractor, llm_client, token_meter, budget,
+                )
+                if evidence_retry:
+                    evidence = evidence_extractor._dedup(evidence + evidence_retry)
             retry_count += 1
 
     # ------------------------------------------------------------------
@@ -192,22 +261,31 @@ def run_question(
     answer_record = answer_judge.judge(parsed, evidence, calculations)
 
     # ------------------------------------------------------------------
-    # Fallback: evidence-insufficient (selected answer lacks support)
+    # Fallback: evidence-insufficient (Phase B: targeted retry, not full re-extract)
     # ------------------------------------------------------------------
     if not _has_support_for_answer(answer_record, parsed):
-        if retry_count < max_retries and all_candidates:
+        if retry_count < max_retries and all_candidates and _check_budget():
             logger.info(
-                "Evidence-insufficient for %s (answer=%s); retrying extraction.",
+                "Evidence-insufficient for %s (answer=%s); targeted retry.",
                 parsed.qid, answer_record.answer,
             )
-            fallbacks.append("evidence_insufficient_retry")
-            widened = _widen_candidates(all_candidates, by=2)
-            evidence_retry = _extract_evidence(
-                parsed, widened, index_store, config,
-                evidence_extractor, llm_client, token_meter,
+            fallbacks.append("evidence_insufficient_targeted_retry")
+            # Targeted: re-extract evidence ONLY for the option(s) missing
+            # support, on the top 1-2 highest-retrieval-order candidate
+            # nodes (lightly widen those nodes by +/-1 page).
+            missing_opts = _missing_support_options(answer_record, parsed)
+            logger.info(
+                "Missing support for options: %s", missing_opts,
             )
-            if evidence_retry:
-                evidence = evidence_extractor._dedup(evidence + evidence_retry)
+            top_nodes = all_candidates[:2]
+            widened_top = _widen_candidates(top_nodes, by=1)
+            if widened_top:
+                evidence_retry = _extract_evidence(
+                    parsed, widened_top, index_store, config,
+                    evidence_extractor, llm_client, token_meter, budget,
+                )
+                if evidence_retry:
+                    evidence = evidence_extractor._dedup(evidence + evidence_retry)
             # Re-calculate and re-judge
             calculations = calc_engine.compute(parsed, evidence)
             answer_record = answer_judge.judge(parsed, evidence, calculations)
@@ -218,7 +296,7 @@ def run_question(
     # ------------------------------------------------------------------
     has_low_confidence = "low_confidence" in answer_record.fallbacks
     has_answer_unclear = any("answer_unclear" in w for w in answer_record.warnings)
-    if (has_low_confidence or has_answer_unclear) and retry_count < max_retries:
+    if (has_low_confidence or has_answer_unclear) and retry_count < max_retries and _check_budget():
         logger.info("Low-confidence answer for %s; retrying judge with filtered evidence.",
                      parsed.qid)
         fallbacks.append("low_confidence_rejudge")
@@ -356,18 +434,21 @@ def _extract_evidence(
     extractor: EvidenceExtractor,
     llm_client: LLMClient | None,
     token_meter: TokenMeter,
+    budget: LLMBudget | None = None,
 ) -> list[EvidenceRecord]:
     """Extract evidence, returning coverage-only records on failure."""
     try:
         return extractor.extract(
             parsed, candidates, index_store, config,
             llm_client=llm_client, token_meter=token_meter,
+            budget=budget,
         )
     except Exception as exc:
         logger.warning("Evidence extraction failed for %s: %s", parsed.qid, exc)
         return extractor.extract(
             parsed, [], index_store, config,
             llm_client=llm_client, token_meter=token_meter,
+            budget=budget,
         )
 
 
@@ -415,6 +496,33 @@ def _has_support_for_answer(record: AnswerRecord, parsed: Any) -> bool:
         if not has_support:
             return False
     return True
+
+
+def _missing_support_options(record: AnswerRecord, parsed: Any) -> list[str]:
+    """Return the answer options that lack *any* support evidence record."""
+    answer = record.answer
+    if not answer:
+        return []
+
+    fmt = getattr(parsed, "answer_format", "mcq")
+    if fmt == "tf":
+        selected_opts = [answer] if answer in ("A", "B") else []
+    elif fmt == "mcq":
+        selected_opts = [answer] if len(answer) == 1 else []
+    elif fmt == "multi":
+        selected_opts = list(answer)
+    else:
+        selected_opts = list(answer)
+
+    missing: list[str] = []
+    for opt in selected_opts:
+        has_support = any(
+            e.evidence_type == "support" and e.option == opt
+            for e in record.evidence
+        )
+        if not has_support:
+            missing.append(opt)
+    return missing
 
 
 def _qid_usage(token_meter: TokenMeter, qid: str) -> dict[str, Any]:

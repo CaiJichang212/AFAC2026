@@ -14,13 +14,16 @@ import json
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agent.config import AgentConfig
 from agent.index_store import IndexStore
 from agent.llm_client import LLMClient, LLMResponse
 from agent.schemas import CandidateNode, EvidenceRecord, ParsedQuestion, UsageRecord
 from agent.token_meter import TokenMeter
+
+if TYPE_CHECKING:
+    from agent.pipeline import LLMBudget
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,7 @@ class EvidenceExtractor:
         *,
         llm_client: LLMClient | None = None,
         token_meter: TokenMeter | None = None,
+        budget: "LLMBudget | None" = None,
     ) -> list[EvidenceRecord]:
         """Extract evidence records for *parsed* from *candidates*.
 
@@ -110,6 +114,9 @@ class EvidenceExtractor:
             llm_client: Optional LLM client.  When ``None``, the deterministic
                 heuristic fallback is used.
             token_meter: Optional token meter for recording LLM usage.
+            budget: Optional per-question LLM-call budget (Phase B).  When the
+                budget is exhausted the heuristic fallback is used instead of
+                calling the LLM.
 
         Returns:
             A list of ``EvidenceRecord`` covering all options A/B/C/D.
@@ -140,21 +147,31 @@ class EvidenceExtractor:
 
             # --- extract ---
             if llm_available:
-                try:
-                    records = self._extract_from_node_llm(
-                        parsed=parsed,
-                        candidate=candidate,
-                        full_text=full_text,
-                        config=config,
-                        llm_client=llm_client,
-                        token_meter=token_meter,
+                # Phase B: check per-question LLM-call budget before calling
+                if budget is not None and not budget.consume():
+                    logger.info(
+                        "LLM call budget exhausted for %s; using heuristic fallback.",
+                        candidate.node_id,
                     )
-                except Exception as exc:
-                    logger.warning("LLM extraction failed for %s: %s; using heuristic fallback.",
-                                   candidate.node_id, exc)
                     records = self._extract_from_node_heuristic(
                         parsed=parsed, candidate=candidate, full_text=full_text, config=config
                     )
+                else:
+                    try:
+                        records = self._extract_from_node_llm(
+                            parsed=parsed,
+                            candidate=candidate,
+                            full_text=full_text,
+                            config=config,
+                            llm_client=llm_client,
+                            token_meter=token_meter,
+                        )
+                    except Exception as exc:
+                        logger.warning("LLM extraction failed for %s: %s; using heuristic fallback.",
+                                       candidate.node_id, exc)
+                        records = self._extract_from_node_heuristic(
+                            parsed=parsed, candidate=candidate, full_text=full_text, config=config
+                        )
             else:
                 records = self._extract_from_node_heuristic(
                     parsed=parsed, candidate=candidate, full_text=full_text, config=config
