@@ -81,6 +81,27 @@ class EvidenceRecord:
 
 
 # ---------------------------------------------------------------------------
+# Calculation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CalculationRecord:
+    """A single deterministic calculation result.
+
+    Used by the CalculationEngine to record structured arithmetic on
+    question-stem numbers and evidence-supplied formulas/parameters.
+    """
+
+    qid: str
+    calc_type: str  # e.g. "death_benefit_comparison", "medical_payout", "ranking"
+    inputs: dict[str, Any]  # the numeric inputs used
+    formula: str = ""  # human-readable formula string
+    result: float = 0.0
+    unit: str = ""  # "元" / "%" / ""
+    source_evidence_ids: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Answer
 # ---------------------------------------------------------------------------
 
