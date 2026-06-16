@@ -118,7 +118,7 @@ class AnswerRecord:
     usage: dict[str, Any] = field(default_factory=dict)  # UsageRecord fields
     fallbacks: list[str] = field(default_factory=list)  # fallback paths taken
     warnings: list[str] = field(default_factory=list)
-    option_judgements: dict[str, str] = field(default_factory=dict)  # option -> "correct"/"incorrect"/"unclear"
+    option_judgements: dict[str, dict[str, Any]] = field(default_factory=dict)  # option -> {support_count, refute_count, ...}
 
 
 # ---------------------------------------------------------------------------

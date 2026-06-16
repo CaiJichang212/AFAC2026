@@ -5,7 +5,9 @@ Also serves as the shared test file for output validation (Task 11).
 
 from __future__ import annotations
 
+import csv
 import json
+from io import StringIO
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +22,11 @@ from agent.evidence_extractor import (
 from agent.index_store import IndexStore, PageText
 from agent.llm_client import LLMClient, MockApiCaller
 from agent.schemas import CandidateNode, EvidenceRecord, ParsedQuestion
+from scripts.validate_outputs import (
+    validate_answer_csv_rows,
+    validate_evidence_jsonl_lines,
+    validate_usage_jsonl_lines,
+)
 
 
 # ===========================================================================
@@ -1515,3 +1522,344 @@ class TestEvidenceExtractionIntegration:
                 assert rec.quote in full_text, (
                     f"Quote not in page text for option {rec.option}: {rec.quote!r}"
                 )
+
+
+# ===========================================================================
+# TestOutputValidation — output artifact validation (Task 11)
+# ===========================================================================
+
+
+def _make_questions() -> list[dict]:
+    """Return a minimal set of synthetic questions matching the real structure."""
+    return [
+        {"qid": "ins_a_001", "answer_format": "mcq"},
+        {"qid": "ins_a_002", "answer_format": "mcq"},
+        {"qid": "ins_a_003", "answer_format": "mcq"},
+        {"qid": "ins_a_004", "answer_format": "mcq"},
+        {"qid": "ins_a_005", "answer_format": "mcq"},
+        {"qid": "ins_a_006", "answer_format": "mcq"},
+        {"qid": "ins_a_007", "answer_format": "mcq"},
+        {"qid": "ins_a_008", "answer_format": "mcq"},
+        {"qid": "ins_a_009", "answer_format": "mcq"},
+        {"qid": "ins_a_010", "answer_format": "mcq"},
+        {"qid": "ins_a_011", "answer_format": "multi"},
+        {"qid": "ins_a_012", "answer_format": "multi"},
+        {"qid": "ins_a_013", "answer_format": "multi"},
+        {"qid": "ins_a_014", "answer_format": "multi"},
+        {"qid": "ins_a_015", "answer_format": "multi"},
+        {"qid": "ins_a_016", "answer_format": "multi"},
+        {"qid": "ins_a_017", "answer_format": "tf"},
+        {"qid": "ins_a_018", "answer_format": "tf"},
+        {"qid": "ins_a_019", "answer_format": "tf"},
+        {"qid": "ins_a_020", "answer_format": "tf"},
+    ]
+
+
+def _make_valid_answer_csv_rows(
+    questions: list[dict],
+    *,
+    summary_tokens: int = 5000,
+    per_q_tokens: int = 250,
+) -> list[dict[str, str]]:
+    """Build a fully valid set of answer.csv rows."""
+    rows: list[dict[str, str]] = []
+    # summary row
+    rows.append({
+        "qid": "summary",
+        "answer": "",
+        "prompt_tokens": str(summary_tokens // 2),
+        "completion_tokens": str(summary_tokens // 4),
+        "total_tokens": str(summary_tokens),
+    })
+    # question rows
+    for q in questions:
+        fmt = q["answer_format"]
+        if fmt == "mcq":
+            answer = "A"
+        elif fmt == "multi":
+            answer = "AC"
+        elif fmt == "tf":
+            answer = "A"
+        else:
+            answer = "A"
+        rows.append({
+            "qid": q["qid"],
+            "answer": answer,
+            "prompt_tokens": str(per_q_tokens // 2),
+            "completion_tokens": str(per_q_tokens // 4),
+            "total_tokens": str(per_q_tokens),
+        })
+    return rows
+
+
+def _make_valid_evidence_jsonl_lines(
+    questions: list[dict],
+) -> list[dict]:
+    """Build fully valid evidence.jsonl records (traceable)."""
+    lines: list[dict] = []
+    for q in questions:
+        fmt = q["answer_format"]
+        if fmt == "mcq":
+            answer = "A"
+            selected_opts = ["A"]
+        elif fmt == "multi":
+            answer = "AC"
+            selected_opts = ["A", "C"]
+        elif fmt == "tf":
+            answer = "A"
+            selected_opts = ["A"]
+        else:
+            answer = "A"
+            selected_opts = ["A"]
+
+        evidence = []
+        for opt in selected_opts:
+            evidence.append({
+                "qid": q["qid"],
+                "doc_id": "1",
+                "node_id": f"n_{opt}",
+                "pages": "1-3",
+                "option": opt,
+                "evidence_type": "support",
+                "quote": f"quote for {opt}",
+                "normalized_fact": f"fact for {opt}",
+                "confidence": "high",
+            })
+        # Add some unrelated evidence
+        for opt in ("B", "D"):
+            evidence.append({
+                "qid": q["qid"],
+                "doc_id": "1",
+                "node_id": f"n_{opt}",
+                "pages": "1-3",
+                "option": opt,
+                "evidence_type": "unclear",
+                "quote": "",
+                "normalized_fact": "",
+                "confidence": "low",
+            })
+
+        lines.append({
+            "qid": q["qid"],
+            "answer": answer,
+            "evidence": evidence,
+            "option_judgements": {},
+        })
+    return lines
+
+
+class TestOutputValidation:
+    """Tests for scripts/validate_outputs.py core validation functions."""
+
+    # ------------------------------------------------------------------
+    # Valid inputs pass
+    # ------------------------------------------------------------------
+
+    def test_valid_answer_csv_passes(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        failures = validate_answer_csv_rows(rows, questions)
+        assert failures == [], f"Expected no failures, got: {failures}"
+
+    def test_valid_evidence_jsonl_passes(self) -> None:
+        questions = _make_questions()
+        lines = _make_valid_evidence_jsonl_lines(questions)
+        failures = validate_evidence_jsonl_lines(lines, questions)
+        assert failures == [], f"Expected no failures, got: {failures}"
+
+    # ------------------------------------------------------------------
+    # Summary row checks
+    # ------------------------------------------------------------------
+
+    def test_missing_summary_row(self) -> None:
+        questions = _make_questions()
+        # No "summary" qid in first position
+        rows = [
+            {"qid": "ins_a_001", "answer": "A",
+             "prompt_tokens": "100", "completion_tokens": "50", "total_tokens": "150"},
+        ] * 20
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("summary" in f.lower() for f in failures)
+
+    def test_summary_wrong_qid_label(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        rows[0]["qid"] = "totals"  # wrong label
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("summary" in f for f in failures)
+
+    # ------------------------------------------------------------------
+    # QID coverage
+    # ------------------------------------------------------------------
+
+    def test_wrong_qid_count(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        # Remove one question row
+        rows = [rows[0]] + rows[2:]  # drop ins_a_001
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("19" in f or "20" in f or "Expected" in f for f in failures)
+
+    def test_missing_qid(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        # Rename a qid to simulate missing
+        for r in rows:
+            if r["qid"] == "ins_a_001":
+                r["qid"] = "ins_a_099"
+                break
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("missing" in f.lower() for f in failures) or any("Missing" in f for f in failures)
+
+    # ------------------------------------------------------------------
+    # Answer format validation
+    # ------------------------------------------------------------------
+
+    def test_bad_mcq_format_lowercase(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        rows[1]["answer"] = "a"  # lowercase is invalid for mcq
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("mcq" in f.lower() for f in failures)
+
+    def test_bad_mcq_format_multiple_letters(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        rows[1]["answer"] = "AB"  # mcq must be single letter
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("mcq" in f.lower() for f in failures)
+
+    def test_bad_multi_format_duplicates(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        # Find a multi row
+        for i, r in enumerate(rows):
+            q = next((q for q in questions if q["qid"] == r["qid"]), None)
+            if q and q["answer_format"] == "multi":
+                rows[i]["answer"] = "AAC"  # duplicates
+                break
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("duplicate" in f.lower() or "no duplicates" in f.lower() for f in failures)
+
+    def test_bad_multi_format_not_sorted(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        for i, r in enumerate(rows):
+            q = next((q for q in questions if q["qid"] == r["qid"]), None)
+            if q and q["answer_format"] == "multi":
+                rows[i]["answer"] = "CA"  # not sorted
+                break
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("sorted" in f.lower() for f in failures)
+
+    def test_bad_multi_format_with_spaces(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        for i, r in enumerate(rows):
+            q = next((q for q in questions if q["qid"] == r["qid"]), None)
+            if q and q["answer_format"] == "multi":
+                rows[i]["answer"] = "A C"  # spaces not allowed
+                break
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any(failures)
+
+    def test_bad_tf_format(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        for i, r in enumerate(rows):
+            q = next((q for q in questions if q["qid"] == r["qid"]), None)
+            if q and q["answer_format"] == "tf":
+                rows[i]["answer"] = "C"  # must be A or B
+                break
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("A' or 'B'" in f for f in failures)
+
+    def test_empty_answer(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions)
+        rows[1]["answer"] = ""
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("empty" in f.lower() for f in failures)
+
+    # ------------------------------------------------------------------
+    # Token sum check
+    # ------------------------------------------------------------------
+
+    def test_summary_token_mismatch(self) -> None:
+        questions = _make_questions()
+        rows = _make_valid_answer_csv_rows(questions, summary_tokens=9999, per_q_tokens=100)
+        failures = validate_answer_csv_rows(rows, questions)
+        assert any("total_tokens" in f for f in failures)
+
+    def test_token_sum_matches(self) -> None:
+        """When summary matches sum of per-question tokens, no failure."""
+        questions = _make_questions()
+        per_q = 250
+        rows = _make_valid_answer_csv_rows(
+            questions, summary_tokens=per_q * len(questions), per_q_tokens=per_q
+        )
+        failures = validate_answer_csv_rows(rows, questions)
+        assert failures == [], f"Expected no failures, got: {failures}"
+
+    # ------------------------------------------------------------------
+    # Evidence traceability
+    # ------------------------------------------------------------------
+
+    def test_selected_option_lacks_support_evidence(self) -> None:
+        questions = _make_questions()
+        lines = _make_valid_evidence_jsonl_lines(questions)
+        # Change the first mcq question's evidence: remove support for its answer
+        lines[0]["answer"] = "B"  # but evidence has support for A, not B
+        # Remove support evidence for B
+        lines[0]["evidence"] = [e for e in lines[0]["evidence"] if e["option"] != "B"]
+        failures = validate_evidence_jsonl_lines(lines, questions)
+        assert any("no support evidence" in f.lower() for f in failures)
+
+    def test_each_multi_letter_needs_support(self) -> None:
+        questions = _make_questions()
+        lines = _make_valid_evidence_jsonl_lines(questions)
+        # Multi question: answer "AC" but remove support for C
+        for line in lines:
+            q = next((q for q in questions if q["qid"] == line["qid"]), None)
+            if q and q["answer_format"] == "multi":
+                # Remove support for C
+                line["evidence"] = [e for e in line["evidence"]
+                                    if not (e["option"] == "C" and e["evidence_type"] == "support")]
+                break
+        failures = validate_evidence_jsonl_lines(lines, questions)
+        assert any("no support evidence" in f.lower() for f in failures)
+
+    def test_missing_qid_in_evidence(self) -> None:
+        questions = _make_questions()
+        lines = _make_valid_evidence_jsonl_lines(questions)
+        # Remove one line
+        lines = lines[:-1]
+        failures = validate_evidence_jsonl_lines(lines, questions)
+        assert any("missing record" in f.lower() for f in failures)
+
+    # ------------------------------------------------------------------
+    # usage.jsonl validation
+    # ------------------------------------------------------------------
+
+    def test_usage_jsonl_missing_qid(self) -> None:
+        questions = _make_questions()
+        # Only include half the qids
+        lines = [{"qid": q["qid"]} for q in questions[:-1]]
+        failures = validate_usage_jsonl_lines(lines, questions)
+        assert any("missing qids" in f.lower() for f in failures)
+
+    def test_usage_jsonl_all_present(self) -> None:
+        questions = _make_questions()
+        lines = [{"qid": q["qid"]} for q in questions]
+        failures = validate_usage_jsonl_lines(lines, questions)
+        assert failures == []
+
+    # ------------------------------------------------------------------
+    # Edge: empty inputs
+    # ------------------------------------------------------------------
+
+    def test_empty_csv_rows(self) -> None:
+        questions = _make_questions()
+        failures = validate_answer_csv_rows([], questions)
+        assert any(failures)
+        assert any("empty" in f.lower() for f in failures)
