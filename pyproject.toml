@@ -1,0 +1,23 @@
+[project]
+name = "afac2026-insurance-agent"
+version = "0.1.0"
+description = "AFAC 2026 insurance QA pipeline agent"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf",
+    "litellm",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent*", "scripts*", "tests*"]
