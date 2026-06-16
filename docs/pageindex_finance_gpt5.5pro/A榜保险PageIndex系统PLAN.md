@@ -45,7 +45,7 @@
 - A 榜在线链路只使用题目给定 `doc_ids`，不引入题外文档。
 - 推理问答阶段的文档定位、检索、压缩、证据判断、答案生成和自检必须使用 Qwen 系列模型并统计 Token。
 - `docs/模型配置.md` 中的 `ark-code-latest` 只作为开发调试配置；其结果不得进入正式提交链路。
-- PageIndex 默认 `config.yaml` 和 `PageIndexClient.index()` 不是正式入口，因为默认模型不是 Qwen，且 `PageIndexClient.index()` 会生成随机 UUID、默认开启摘要/正文/文档描述。
+- `PageIndexClient.index()` 不是正式入口，因为它会生成随机 UUID、默认开启摘要/正文/文档描述；PageIndex 源码会读取默认 `config.yaml`，但项目侧必须显式覆盖模型和摘要/正文/描述等赛题相关参数。
 
 ## 2. Target Architecture
 
@@ -107,11 +107,14 @@ raw insurance PDFs
 | `scripts/run_answers.py` | CLI：运行 A 榜保险答题流水线。 |
 | `scripts/validate_outputs.py` | CLI：校验输出 schema、答案格式、证据追溯和 usage。 |
 | `tests/agent/test_config.py` | 配置路径和默认值测试。 |
+| `tests/agent/test_domain_profiles.py` | 保险领域 profile、关键词和别名测试。 |
 | `tests/agent/test_preprocess.py` | 页缓存、Markdown、page_map schema 测试。 |
 | `tests/agent/test_pageindex_adapter.py` | PageIndex 显式参数和禁用高层入口测试。 |
 | `tests/agent/test_index_store.py` | `line_num -> page_range`、PDF 兜底归一化测试。 |
+| `tests/agent/test_catalog.py` | catalog 覆盖率和字段 schema 测试。 |
 | `tests/agent/test_question_parser.py` | 产品别名、数值条件、选项关键词解析测试。 |
 | `tests/agent/test_doc_retriever.py` | A 榜 `doc_ids` passthrough 和题外文档禁止测试。 |
+| `tests/agent/test_calculation.py` | 金额、比例、扣减和排序计算测试。 |
 | `tests/agent/test_answer_judge.py` | `mcq/multi/tf` 答案合法化测试。 |
 | `tests/agent/test_validate_outputs.py` | `answer.csv`、`evidence.jsonl` 验收测试。 |
 
@@ -158,6 +161,14 @@ class AgentConfig:
     output_root: Path = Path("outputs")
     inference_model: str = "dashscope/qwen3.6-plus"
     dev_model: str | None = None
+    toc_check_page_num: int = 20
+    max_page_num_each_node: int = 8
+    max_token_num_each_node: int = 20000
+    max_docs_per_question: int = 4
+    max_nodes_per_doc: int = 5
+    max_pages_per_doc: int = 8
+    max_evidence_per_option: int = 3
+    max_retry_per_question: int = 1
 ```
 
 派生路径规则：
@@ -169,6 +180,14 @@ class AgentConfig:
 | `output_dir` | `outputs/insurance_a` |
 | `pages_dir` | `data/processed_data/pages/insurance` |
 | `pageindex_dir` | `data/processed_data/pageindex/insurance` |
+| `logs_dir` | `outputs/insurance_a/logs` |
+
+PageIndex 默认配置处理：
+
+- PageIndex `page_index()` 内部会通过 `ConfigLoader` 读取 `open_projects/PageIndex/pageindex/config.yaml`，再合并项目侧传入参数。
+- 项目侧不得依赖默认 `model`、`if_add_node_summary`、`if_add_doc_description`、`if_add_node_text`、`toc_check_page_num`、`max_page_num_each_node`、`max_token_num_each_node` 等值。
+- 适配器必须显式覆盖赛题相关参数，并把实际生效配置写入构建日志。
+- `max_docs_per_question`、`max_nodes_per_doc`、`max_pages_per_doc`、`max_evidence_per_option`、`max_retry_per_question` 是在线检索预算配置，不允许在检索代码中散落硬编码常量。
 
 ### 4.2 PageIndex Adapter
 
@@ -195,6 +214,7 @@ result = page_index(
     model=config.inference_model,
     toc_check_page_num=config.toc_check_page_num,
     max_page_num_each_node=config.max_page_num_each_node,
+    max_token_num_each_node=config.max_token_num_each_node,
     if_add_node_summary="no",
     if_add_doc_description="no",
     if_add_node_text="no",
@@ -205,7 +225,7 @@ result = page_index(
 禁止项测试必须覆盖：
 
 - 不调用 `PageIndexClient.index()`。
-- 不隐式读取 `open_projects/PageIndex/pageindex/config.yaml` 的默认模型和摘要开关。
+- 不依赖 `open_projects/PageIndex/pageindex/config.yaml` 的默认模型、摘要、正文、文档描述和 PDF 构树预算参数。
 - 不把 `text` 字段写入紧凑树给在线问答模块。
 
 ### 4.3 Data Schemas
@@ -301,12 +321,19 @@ AnswerJudge.judge(parsed: ParsedQuestion, evidence: list[EvidenceRecord], calcul
 
 - `node_id`
 - `title`
-- `summary`
+- `summary` optional / nullable
+- `prefix_summary` optional / nullable
 - `page_range`
 - `nodes`
 - `index_source`
 
-即使底层索引含 `line_num`、`start_index`、`end_index` 或 `text`，在线问答模块也只能看到统一后的 `page_range`。
+即使底层索引含 `line_num`、`start_index`、`end_index` 或 `text`，在线问答模块也只能看到统一后的 `page_range`。当前默认主路关闭 `if_add_node_summary`，因此树检索不得把空的 `summary` 或 `prefix_summary` 当作检索依据；默认检索信号是 `title`、`page_range`、层级关系、保险关键词、题干和选项信号。若未来启用 summary，必须使用正式 Qwen 模型生成并记录构建 Token。
+
+### 4.5 LLM Usage And PageIndex Build Tokens
+
+在线推理问答阶段的 Qwen 调用必须通过 `LLMClient` 和 `TokenMeter`，调用日志至少包含 `qid`、`stage`、`model`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`latency_ms`、`success`、`error`。
+
+PageIndex 离线索引构建的 LLM 调用单独写入构建日志，不混入每题在线答题 Token。若正式答题阶段触发 PageIndex PDF 兜底构建、索引修复或摘要生成，则这些调用必须纳入对应题目的 Token 统计。实现时需要通过项目侧包装或 monkeypatch PageIndex 的 `llm_completion()` / `llm_acompletion()` 捕获 usage；如果无法捕获 usage，则禁止在正式答题阶段触发 PageIndex 内部 LLM 调用。
 
 ## 5. Implementation Tasks
 
@@ -317,17 +344,23 @@ AnswerJudge.judge(parsed: ParsedQuestion, evidence: list[EvidenceRecord], calcul
 - Create: `agent/__init__.py`
 - Create: `agent/config.py`
 - Create: `agent/schemas.py`
+- Create: `agent/llm_client.py`
+- Create: `agent/token_meter.py`
 - Create: `scripts/build_preprocess.py`
 - Create: `scripts/build_pageindex.py`
 - Create: `scripts/run_answers.py`
 - Create: `scripts/validate_outputs.py`
 - Test: `tests/agent/test_config.py`
 
-- [ ] Step 1: 定义 `AgentConfig`、路径派生函数和 CLI 参数。
-- [ ] Step 2: 写测试验证 `--domain insurance --split A` 派生到当前题目文件、PDF 目录和输出目录。
-- [ ] Step 3: 写测试验证 `split` 输出目录统一小写，当前为 `outputs/insurance_a`。
-- [ ] Step 4: 运行 `pytest tests/agent/test_config.py -q`，期望通过。
-- [ ] Step 5: 提交：
+- [ ] Step 1: 定义 `AgentConfig`、路径派生函数、PageIndex 构建参数、在线检索预算参数和 CLI 参数。
+- [ ] Step 2: 定义基础 usage schema，字段至少包含 `stage/model/prompt_tokens/completion_tokens/total_tokens/latency_ms/success/error`。
+- [ ] Step 3: 创建可 mock 的 `LLMClient` 骨架，统一承接后续 Qwen JSON 调用、重试和错误包装。
+- [ ] Step 4: 创建 `TokenMeter` 骨架，支持按 `qid/stage` 累加 usage、写 JSONL 日志和生成 `answer.csv` 所需汇总。
+- [ ] Step 5: 写测试验证 `--domain insurance --split A` 派生到当前题目文件、PDF 目录、输出目录和日志目录。
+- [ ] Step 6: 写测试验证 PageIndex 构建参数和在线检索预算参数存在且默认值符合第 4.1 节。
+- [ ] Step 7: 写测试验证 `split` 输出目录统一小写，当前为 `outputs/insurance_a`。
+- [ ] Step 8: 运行 `pytest tests/agent/test_config.py -q`，期望通过。
+- [ ] Step 9: 提交：
 
 ```bash
 git add agent scripts tests/agent/test_config.py
@@ -340,16 +373,16 @@ git commit -m "feat: add configurable insurance pipeline skeleton"
 
 - Create: `agent/domain_profiles/__init__.py`
 - Create: `agent/domain_profiles/insurance.py`
-- Test: `tests/agent/test_question_parser.py`
+- Test: `tests/agent/test_domain_profiles.py`
 
 - [ ] Step 1: 定义 `DomainProfile`，包含 `keywords`、`product_aliases`、`liability_terms`、`calculation_patterns`、`quality_thresholds`。
 - [ ] Step 2: 在 `insurance.py` 写入当前 16 个文档涉及的产品名和简称，例如平安智盈金生、国寿增益宝、众安白血病医疗险、平安 e 生保、太保团体百万医疗、家财险、特种车险。
 - [ ] Step 3: 写测试验证题干中的产品简称能映射到候选产品名。
-- [ ] Step 4: 运行 `pytest tests/agent/test_question_parser.py -q`，期望通过。
+- [ ] Step 4: 运行 `pytest tests/agent/test_domain_profiles.py -q`，期望通过。
 - [ ] Step 5: 提交：
 
 ```bash
-git add agent/domain_profiles tests/agent/test_question_parser.py
+git add agent/domain_profiles tests/agent/test_domain_profiles.py
 git commit -m "feat: add insurance domain profile"
 ```
 
@@ -442,16 +475,16 @@ git commit -m "feat: build pageindex node spans and quality reports"
 
 - Create: `agent/catalog.py`
 - Create: `scripts/build_catalog.py`
-- Test: `tests/agent/test_doc_retriever.py`
+- Test: `tests/agent/test_catalog.py`
 
 - [ ] Step 1: 从 PDF 文件名、Markdown 标题、题目中出现的产品名和保险公司信号生成 `doc_catalog.jsonl`。
 - [ ] Step 2: 每行至少包含 `doc_id/product_name/aliases/insurer/insurance_type/source_pdf/top_titles/primary_index_route`。
 - [ ] Step 3: A 榜要求 catalog 覆盖 `1` 到 `16`，且题目中的 `doc_ids` 全部可查。
-- [ ] Step 4: 写测试验证 `DocRetriever` 不因 catalog 中别名命中而引入题外 `doc_id`。
+- [ ] Step 4: 写测试验证 catalog 字段完整、`doc_id` 唯一、覆盖题目中出现的全部 `doc_ids`。
 - [ ] Step 5: 运行：
 
 ```bash
-pytest tests/agent/test_doc_retriever.py -q
+pytest tests/agent/test_catalog.py -q
 python scripts/build_catalog.py --domain insurance --split A
 ```
 
@@ -460,7 +493,7 @@ python scripts/build_catalog.py --domain insurance --split A
 - [ ] Step 6: 提交：
 
 ```bash
-git add agent/catalog.py scripts/build_catalog.py tests/agent/test_doc_retriever.py data/processed_data/catalog
+git add agent/catalog.py scripts/build_catalog.py tests/agent/test_catalog.py data/processed_data/catalog
 git commit -m "feat: build insurance document catalog"
 ```
 
@@ -480,7 +513,7 @@ git commit -m "feat: build insurance document catalog"
 - [ ] Step 5: 运行：
 
 ```bash
-pytest tests/agent/test_question_parser.py tests/agent/test_doc_retriever.py -q
+pytest -q tests/agent/test_question_parser.py tests/agent/test_doc_retriever.py
 ```
 
 期望：20 道保险题均能解析；所有返回文档 ID 均来自原题。
@@ -519,8 +552,8 @@ git commit -m "feat: retrieve candidate nodes from compact pageindex trees"
 **Files:**
 
 - Create: `agent/evidence_extractor.py`
-- Modify: `agent/llm_client.py`
-- Modify: `agent/token_meter.py`
+- Extend: `agent/llm_client.py`
+- Extend: `agent/token_meter.py`
 - Test: `tests/agent/test_validate_outputs.py`
 
 - [ ] Step 1: 对每个 `CandidateNode` 调用 `IndexStore.get_page_content(doc_id, page_range)` 读取页级原文。
@@ -542,17 +575,17 @@ git commit -m "feat: extract option-level evidence from page text"
 **Files:**
 
 - Create: `agent/calculation.py`
-- Test: `tests/agent/test_answer_judge.py`
+- Test: `tests/agent/test_calculation.py`
 
 - [ ] Step 1: 实现金额单位归一化，支持元、万元、百分比、保单年度。
 - [ ] Step 2: 覆盖当前保险题高频计算：身故保险金比较、退保所得、医疗费用扣除医保和免赔额、赔付比例与最高限额、排序比较。
 - [ ] Step 3: 计算结果记录 `inputs/formula/result/unit/source_evidence_ids`。
 - [ ] Step 4: 写测试覆盖 `ins_a_001` 风格排序和 `ins_a_003` 风格医疗费用扣减。
-- [ ] Step 5: 运行 `pytest tests/agent/test_answer_judge.py -q`，期望通过。
+- [ ] Step 5: 运行 `pytest tests/agent/test_calculation.py -q`，期望通过。
 - [ ] Step 6: 提交：
 
 ```bash
-git add agent/calculation.py tests/agent/test_answer_judge.py
+git add agent/calculation.py tests/agent/test_calculation.py
 git commit -m "feat: add deterministic insurance calculation engine"
 ```
 
@@ -591,7 +624,7 @@ git commit -m "feat: judge and validate formatted insurance answers"
 
 - Create: `agent/pipeline.py`
 - Modify: `scripts/run_answers.py`
-- Modify: `agent/token_meter.py`
+- Extend: `agent/token_meter.py`
 - Test: `tests/agent/test_validate_outputs.py`
 
 - [ ] Step 1: `pipeline.py` 编排单题：parse -> doc retrieve -> structure -> tree retrieve -> evidence -> calculation -> answer -> audit。
@@ -654,12 +687,15 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 | 测试 | 命令 | 验收点 |
 | --- | --- | --- |
 | 配置 | `pytest tests/agent/test_config.py -q` | domain/split/path/model 派生正确。 |
+| 领域 profile | `pytest tests/agent/test_domain_profiles.py -q` | 保险关键词、产品别名、责任类别和质量阈值可用。 |
 | 预处理 | `pytest tests/agent/test_preprocess.py -q` | 16 个 PDF、299 页、页文本非空、page_map 完整。 |
 | PageIndex 适配 | `pytest tests/agent/test_pageindex_adapter.py -q` | 只调用底层函数，显式关闭摘要/正文/描述。 |
 | 索引存储 | `pytest tests/agent/test_index_store.py -q` | `line_num` 不外泄；`page_range` 合法；坏节点标记。 |
-| 题目解析 | `pytest tests/agent/test_question_parser.py -q` | 产品别名、数值条件、选项关键词可解析。 |
-| 文档检索 | `pytest tests/agent/test_doc_retriever.py -q` | A 榜只返回题目 `doc_ids`。 |
-| 答案合法化 | `pytest tests/agent/test_answer_judge.py -q` | `mcq/multi/tf` 输出合法。 |
+| catalog | `pytest tests/agent/test_catalog.py -q` | catalog 覆盖 16 个 doc_id，字段完整且 doc_id 唯一。 |
+| 题目解析 | `pytest -q tests/agent/test_question_parser.py tests/agent/test_doc_retriever.py` | 产品别名、数值条件、选项关键词可解析。 |
+| 文档检索 | `pytest -q tests/agent/test_question_parser.py tests/agent/test_doc_retriever.py` | A 榜只返回题目 `doc_ids`。 |
+| 计算引擎 | `pytest tests/agent/test_calculation.py -q` | 金额、比例、扣减和排序计算可复现。 |
+| 答案合法化 | `pytest -q tests/agent/test_answer_judge.py tests/agent/test_validate_outputs.py` | `mcq/multi/tf` 输出合法。 |
 | 输出校验 | `pytest tests/agent/test_validate_outputs.py -q` | `answer.csv`、`evidence.jsonl` schema 与追溯合格。 |
 | 全量单元测试 | `pytest tests/agent -q` | 全部通过。 |
 | 预处理运行 | `python scripts/build_preprocess.py --domain insurance --split A` | 生成 pages/markdown/page_map/parse quality。 |
@@ -676,6 +712,7 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 - 页缓存总页数为 299，所有页有可抽取文本。
 - 每个文档均尝试 Markdown 主索引；主索引不合格时记录原因并触发 PDF 兜底或页级关键词降级。
 - 可用 Markdown 主索引都有 `node_spans`，所有暴露给在线模块的节点都有 PDF `page_range`。
+- 默认主索引关闭节点摘要；紧凑树中的 `summary/prefix_summary` 仅为 optional/nullable 字段，不作为默认检索依据。
 - `doc_catalog.jsonl` 覆盖 16 个 `doc_id`，且能校验 A 榜题目中的 `doc_ids`。
 
 问答链路：
@@ -697,6 +734,7 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 - `summary.total_tokens` 等于题目行 Token 之和。
 - `evidence.jsonl` 每题一行，包含 `qid/answer/candidate_docs/selected_nodes/evidence/calculations/usage/fallbacks/warnings/option_judgements`。
 - 日志包含 `qid/stage/model/prompt_tokens/completion_tokens/total_tokens/latency_ms/success/error`。
+- PageIndex 离线构建日志与在线答题 Token 分开记录；若正式答题阶段触发 PageIndex 内部 LLM 调用，必须计入对应题目 usage。
 - 日志不保存 API Key、标准答案或题外答案信息。
 
 合规与扩展：
@@ -705,6 +743,7 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 - 不修改 `open_projects/PageIndex`。
 - 正式推理问答阶段只使用 Qwen 系列模型。
 - 开发 ARK 调试结果不进入正式索引、检索、证据或答案产物。
+- 项目侧适配器必须显式覆盖 PageIndex 默认模型、摘要、正文、文档描述和 PDF 构树预算参数。
 - 保险专属逻辑集中在 `agent/domain_profiles/insurance.py`、catalog 和计算规则中。
 - B 榜扩展点仅体现在 `DocRetriever` 接口和 catalog，不影响 A 榜主流程。
 
@@ -714,8 +753,10 @@ git commit -m "docs: document reproducible insurance pageindex workflow"
 | --- | --- |
 | PDF outline 缺失 | Markdown 主路基于保险标题恢复结构；质量不足才走 PDF 兜底。 |
 | Markdown 行号被误当页码 | `IndexStore` 只暴露 `page_range`，测试禁止 `line_num` 外泄。 |
-| PageIndex 默认模型/开关不合规 | 适配器显式传参；测试禁止高层 `PageIndexClient.index()`。 |
+| PageIndex 默认模型/开关不合规 | 适配器显式覆盖赛题相关参数；测试禁止高层 `PageIndexClient.index()`，并断言不依赖默认模型和摘要开关。 |
+| 关闭摘要后树检索信号不足 | 默认使用 `title/page_range/层级/保险关键词/题干和选项信号`；不得把空 `summary` 当作有效依据。 |
 | 非 Qwen 调试污染正式结果 | 配置区分 `inference_model` 与 `dev_model`；正式命令默认 Qwen。 |
+| PageIndex 内部 LLM usage 缺失 | 离线构建单独记录；在线触发时必须包装或 monkeypatch PageIndex LLM 函数捕获 usage，否则禁止在线触发。 |
 | 多选题漏选/多选 | `AnswerJudge` 对每个选项单独 verdict，最后程序化去重排序。 |
 | 计算题模型口算错误 | `CalculationEngine` 统一处理金额、比例、扣减和排序。 |
 | Token 统计缺失 | 所有 LLM 调用必须通过 `LLMClient` 和 `TokenMeter`。 |
