@@ -145,6 +145,11 @@ def run_question(
     calc_engine = CalculationEngine(doc_product_map=profile.doc_product_map)
     answer_judge = AnswerJudge()
 
+    # Phase D: these are set in stage 3/4; initialised here to avoid
+    # UnboundLocalError in branches that may not reach those stages.
+    evidence: list[EvidenceRecord] = []
+    calculations: list[Any] = []
+
     max_retries = config.max_retry_per_question
     retry_count = 0
     fallbacks: list[str] = []
@@ -216,44 +221,82 @@ def run_question(
         all_candidates.extend(candidates)
 
     # ------------------------------------------------------------------
-    # Stage 3: Evidence extraction
+    # Stage 3: Evidence extraction (Phase D: fact-matrix path for computation questions)
     # ------------------------------------------------------------------
-    evidence = _extract_evidence(
-        parsed, all_candidates, index_store, config,
-        evidence_extractor, llm_client, token_meter, budget,
-    )
+    from agent.calculation import is_computation_question
+
+    _use_fact_matrix = is_computation_question(parsed) and llm_client is not None
+
+    if _use_fact_matrix:
+        logger.info(
+            "%s routed to fact-matrix path (type=%s, keywords matched).",
+            parsed.qid, parsed.type,
+        )
+        facts = evidence_extractor.extract_fact_matrix(
+            parsed, all_candidates, index_store, config,
+            llm_client=llm_client, token_meter=token_meter,
+            budget=budget,
+        )
+        _check_budget()
+
+        if facts:
+            # Compute from facts
+            calculations = calc_engine.compute_from_facts(parsed, facts)
+            # Start with empty evidence; the judge will synthesize support
+            # EvidenceRecords from the calculation's supporting_facts.
+            evidence: list[EvidenceRecord] = []
+            fallbacks.append("fact_matrix_path")
+        else:
+            # Fact extraction produced nothing — fall back to normal
+            # per-page evidence extraction.
+            logger.info(
+                "Fact matrix returned empty for %s; falling back to normal evidence extraction.",
+                parsed.qid,
+            )
+            fallbacks.append("fact_matrix_empty_fallback")
+            _use_fact_matrix = False
+
+    if not _use_fact_matrix:
+        evidence = _extract_evidence(
+            parsed, all_candidates, index_store, config,
+            evidence_extractor, llm_client, token_meter, budget,
+        )
 
     # Record budget exhaustion if the budget was consumed during extraction
     _check_budget()
 
     # ------------------------------------------------------------------
     # Fallback: node-insufficient (Phase B: targeted widen, not full re-extract)
+    # Only for non-fact-matrix path — fact-matrix has its own fallback above.
     # ------------------------------------------------------------------
-    total_pages = sum(_count_pages_in_range(c.page_range) for c in all_candidates)
-    if (len(all_candidates) < 2 or total_pages < 3):
-        if retry_count < max_retries and all_candidates and _check_budget():
-            logger.info(
-                "Node-insufficient for %s (%d candidates, %d pages); targeted widen.",
-                parsed.qid, len(all_candidates), total_pages,
-            )
-            fallbacks.append("node_insufficient_targeted_widen")
-            # Targeted: widen only the top 2 candidates (by retrieval order)
-            # rather than the full candidate set.
-            top_nodes = all_candidates[:2]
-            widened_top = _widen_candidates(top_nodes, by=1)
-            if widened_top:
-                evidence_retry = _extract_evidence(
-                    parsed, widened_top, index_store, config,
-                    evidence_extractor, llm_client, token_meter, budget,
+    if not _use_fact_matrix:
+        total_pages = sum(_count_pages_in_range(c.page_range) for c in all_candidates)
+        if (len(all_candidates) < 2 or total_pages < 3):
+            if retry_count < max_retries and all_candidates and _check_budget():
+                logger.info(
+                    "Node-insufficient for %s (%d candidates, %d pages); targeted widen.",
+                    parsed.qid, len(all_candidates), total_pages,
                 )
-                if evidence_retry:
-                    evidence = evidence_extractor._dedup(evidence + evidence_retry)
-            retry_count += 1
+                fallbacks.append("node_insufficient_targeted_widen")
+                # Targeted: widen only the top 2 candidates (by retrieval order)
+                # rather than the full candidate set.
+                top_nodes = all_candidates[:2]
+                widened_top = _widen_candidates(top_nodes, by=1)
+                if widened_top:
+                    evidence_retry = _extract_evidence(
+                        parsed, widened_top, index_store, config,
+                        evidence_extractor, llm_client, token_meter, budget,
+                    )
+                    if evidence_retry:
+                        evidence = evidence_extractor._dedup(evidence + evidence_retry)
+                retry_count += 1
 
     # ------------------------------------------------------------------
-    # Stage 4: Calculation
+    # Stage 4: Calculation (skip if already computed via fact-matrix path)
     # ------------------------------------------------------------------
-    calculations = calc_engine.compute(parsed, evidence)
+    if not _use_fact_matrix:
+        calculations = calc_engine.compute(parsed, evidence)
+    # else: calculations already set by compute_from_facts above
 
     # ------------------------------------------------------------------
     # Stage 5: Answer judging
@@ -262,8 +305,9 @@ def run_question(
 
     # ------------------------------------------------------------------
     # Fallback: evidence-insufficient (Phase B: targeted retry, not full re-extract)
+    # Only for non-fact-matrix path — fact-matrix judge synthesizes support evidence.
     # ------------------------------------------------------------------
-    if not _has_support_for_answer(answer_record, parsed):
+    if not _use_fact_matrix and not _has_support_for_answer(answer_record, parsed):
         if retry_count < max_retries and all_candidates and _check_budget():
             logger.info(
                 "Evidence-insufficient for %s (answer=%s); targeted retry.",

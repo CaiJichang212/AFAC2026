@@ -814,3 +814,416 @@ class TestDeterminism:
     def test_normalize_amount_deterministic(self):
         for _ in range(5):
             assert normalize_amount(100, "万元") == 1_000_000.0
+
+
+# ===================================================================
+# Phase D: is_computation_question routing
+# ===================================================================
+
+
+class TestIsComputationQuestion:
+    """Tests for is_computation_question routing function."""
+
+    def test_ranking_keyword_detected(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="事实查询",
+        )
+        assert is_computation_question(parsed) is True
+
+    def test_medical_keyword_detected(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="免赔额和医保报销如何计算？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="事实查询",
+        )
+        assert is_computation_question(parsed) is True
+
+    def test_calc_type_detected(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="某产品年化收益率是多少？",  # no calc keywords
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="计算题",
+        )
+        assert is_computation_question(parsed) is True
+
+    def test_reasoning_type_without_keyword_not_routed(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="某产品是否值得购买？",  # no calc keywords
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="推理判断",
+        )
+        # 推理判断 alone (without keywords) does NOT trigger fact-matrix
+        assert is_computation_question(parsed) is False
+
+    def test_reasoning_type_with_keyword_routed(self):
+        """推理判断 + keyword '排序' triggers routing (e.g. ins_a_001)."""
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="推理判断",
+        )
+        assert is_computation_question(parsed) is True
+
+    def test_fact_query_not_routed(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="某产品的保险责任是什么？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="事实查询",
+        )
+        assert is_computation_question(parsed) is False
+
+    def test_surrender_keyword_detected(self):
+        from agent.calculation import is_computation_question
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="退保能拿回多少钱？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="事实查询",
+        )
+        assert is_computation_question(parsed) is True
+
+
+# ===================================================================
+# Phase D: evaluate_formula
+# ===================================================================
+
+
+class TestEvaluateFormula:
+    """Tests for the mini expression evaluator."""
+
+    def test_plain_number(self):
+        from agent.calculation import evaluate_formula
+        assert evaluate_formula("5000", {}) == 5000.0
+        assert evaluate_formula("0", {}) == 0.0
+        assert evaluate_formula("1000000", {}) == 1000000.0
+
+    def test_plain_field_reference(self):
+        from agent.calculation import evaluate_formula
+        stem = {"account_value": 900000}
+        assert evaluate_formula("保单账户价值", stem) == 900000
+        assert evaluate_formula("账户价值", stem) == 900000
+
+    def test_field_multiply(self):
+        from agent.calculation import evaluate_formula
+        stem = {"basic_sum_insured": 900000}
+        assert evaluate_formula("基本保额*1.6", stem) == 1440000.0
+        assert evaluate_formula("基本保险金额*1.6", stem) == 1440000.0
+
+    def test_field_subtract(self):
+        from agent.calculation import evaluate_formula
+        stem = {"premium_paid": 1000000, "annuity_received": 200000}
+        assert evaluate_formula("已交保费-已领养老年金", stem) == 800000
+        assert evaluate_formula("累计所交保费-已领年金", stem) == 800000
+
+    def test_unknown_field_returns_none(self):
+        from agent.calculation import evaluate_formula
+        assert evaluate_formula("未知字段", {}) is None
+        assert evaluate_formula("未知*1.6", {}) is None
+        assert evaluate_formula("未知-已知", {}) is None
+
+    def test_missing_stem_value_returns_none(self):
+        from agent.calculation import evaluate_formula
+        assert evaluate_formula("基本保额*1.6", {}) is None  # no basic_sum_insured
+
+    def test_empty_returns_none(self):
+        from agent.calculation import evaluate_formula
+        assert evaluate_formula("", {}) is None
+        assert evaluate_formula("  ", {}) is None
+
+    def test_decimal_multiplier(self):
+        from agent.calculation import evaluate_formula
+        stem = {"basic_sum_insured": 100000}
+        assert evaluate_formula("基本保额*1.05", stem) == 105000.0
+
+
+# ===================================================================
+# Phase D: compute_from_facts
+# ===================================================================
+
+
+class TestComputeFromFacts:
+    """Tests for compute_from_facts with synthetic fact matrices."""
+
+    def test_ins_a_001_ranking_from_facts(self):
+        """Synthetic fact matrix for ins_a_001 death-benefit ranking.
+
+        Facts:
+        - 平安智盈金生: 身故保险金=保单账户价值 → 900000
+        - 国寿增益宝: 身故保险金=基本保额*1.6 → 1440000
+        - 国寿鑫享添盈: 身故保险金=已交保费-已领养老年金 → 800000
+        - 平安富鸿金生: 身故保险金=已交保费-已领养老年金 → 850000
+        """
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="平安智盈金生", field="身故保险金",
+                formula_or_value="保单账户价值", unit="",
+                quote="保单账户价值为90万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-3",
+            ),
+            FactRecord(
+                product="国寿增益宝", field="身故保险金",
+                formula_or_value="基本保额*1.6", unit="",
+                quote="按基本保额的160%给付身故保险金",
+                source_doc_id="2", source_node_id="n2", source_pages="4-6",
+            ),
+            FactRecord(
+                product="国寿鑫享添盈", field="身故保险金",
+                formula_or_value="已交保费-已领养老年金", unit="",
+                quote="已交保费扣除已领养老年金",
+                source_doc_id="15", source_node_id="n15", source_pages="1-2",
+            ),
+            # Per-product 已领养老年金 values (overrides stem-wide default)
+            FactRecord(
+                product="国寿鑫享添盈", field="已领养老年金",
+                formula_or_value="200000", unit="元",
+                quote="已领养老年金20万元",
+                source_doc_id="15", source_node_id="n15", source_pages="1-2",
+            ),
+            FactRecord(
+                product="平安富鸿金生", field="身故保险金",
+                formula_or_value="已交保费-已领养老年金", unit="",
+                quote="按已交保费减去已领年金给付",
+                source_doc_id="16", source_node_id="n16", source_pages="3-4",
+            ),
+            FactRecord(
+                product="平安富鸿金生", field="已领养老年金",
+                formula_or_value="150000", unit="元",
+                quote="已领养老年金15万元",
+                source_doc_id="16", source_node_id="n16", source_pages="3-4",
+            ),
+        ]
+
+        # Build parsed question with stem number conditions
+        parsed = ParsedQuestion(
+            qid="ins_a_001", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={"A": "a", "B": "b", "C": "c", "D": "d"},
+            answer_format="mcq", type="推理判断",
+            number_conditions=[
+                {"kind": "premium_paid", "value": 1000000, "unit": "元",
+                 "subject": "已交保费", "snippet": "已交保费100万元", "source": "stem"},
+                {"kind": "cash_value", "value": 800000, "unit": "元",
+                 "subject": "现金价值", "snippet": "现金价值80万元", "source": "stem"},
+                {"kind": "account_value", "value": 900000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "保单账户价值90万元", "source": "stem"},
+                {"kind": "basic_sum_insured", "value": 900000, "unit": "元",
+                 "subject": "基本保额", "snippet": "基本保额90万元", "source": "stem"},
+                {"kind": "annuity_received", "value": 200000, "unit": "元",
+                 "subject": "已领养老年金", "snippet": "已领养老年金20万元", "source": "stem"},
+            ],
+        )
+
+        records = engine.compute_from_facts(parsed, facts)
+
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.calc_type == "ranking"
+
+        ranked_order = rec.inputs["ranked_order"]
+        assert len(ranked_order) == 4
+        # Verify order: 增益宝(144万) > 智盈金生(90万) > 富鸿金生(85万) > 鑫享添盈(80万)
+        assert ranked_order[0] == "国寿增益宝"
+        assert ranked_order[1] == "平安智盈金生"
+        assert ranked_order[2] == "平安富鸿金生"
+        assert ranked_order[3] == "国寿鑫享添盈"
+
+        # Verify values
+        ranked_values = rec.inputs["ranked_values"]
+        assert ranked_values["国寿增益宝"] == "1440000"
+        assert ranked_values["平安智盈金生"] == "900000"
+        assert ranked_values["平安富鸿金生"] == "850000"
+        assert ranked_values["国寿鑫享添盈"] == "800000"
+
+        # Verify supporting_facts are populated
+        assert "supporting_facts" in rec.inputs
+        assert len(rec.inputs["supporting_facts"]) == 4
+
+        # Verify source_evidence_ids
+        assert len(rec.source_evidence_ids) == 4
+
+    def test_ins_a_003_medical_from_facts(self):
+        """Synthetic fact matrix for ins_a_003 medical payout.
+
+        Stem: 总费用=80000, 医保报销=30000
+        Facts: 众安免赔额=0, 平安e生保免赔额=5000, 太保免赔额=10000
+        Expected payouts: 50000, 45000, 40000
+        """
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="众安白血病医疗险", field="免赔额",
+                formula_or_value="0", unit="元",
+                quote="0免赔额",
+                source_doc_id="3", source_node_id="n3", source_pages="1-2",
+            ),
+            FactRecord(
+                product="平安e生保", field="免赔额",
+                formula_or_value="5000", unit="元",
+                quote="年度免赔额5000元",
+                source_doc_id="5", source_node_id="n5", source_pages="3-4",
+            ),
+            FactRecord(
+                product="太保团体百万医疗", field="免赔额",
+                formula_or_value="10000", unit="元",
+                quote="免赔额1万元",
+                source_doc_id="6", source_node_id="n6", source_pages="5-6",
+            ),
+        ]
+
+        parsed = ParsedQuestion(
+            qid="ins_a_003", domain="insurance", split="A",
+            question="关于免赔额和医保报销，各产品的赔付金额是多少？",
+            options={"A": "a", "B": "b", "C": "c", "D": "d"},
+            answer_format="mcq", type="计算题",
+            number_conditions=[
+                {"kind": "total_expense", "value": 80000, "unit": "元",
+                 "subject": "总费用", "snippet": "总费用8万元", "source": "stem"},
+                {"kind": "medical_reimbursement", "value": 30000, "unit": "元",
+                 "subject": "医保报销", "snippet": "医保报销3万元", "source": "stem"},
+            ],
+        )
+
+        records = engine.compute_from_facts(parsed, facts)
+
+        assert len(records) == 3
+
+        results = {}
+        for rec in records:
+            assert rec.calc_type == "medical_payout"
+            assert rec.unit == "元"
+            product = rec.inputs["product"]
+            results[product] = rec.result
+            # Verify supporting_facts present
+            assert "supporting_facts" in rec.inputs
+            assert len(rec.inputs["supporting_facts"]) >= 1
+
+        assert results["众安白血病医疗险"] == 50000
+        assert results["平安e生保"] == 45000
+        assert results["太保团体百万医疗"] == 40000
+
+    def test_medical_with_ratio_and_cap(self):
+        """Medical payout with explicit 给付比例 and 最高限额."""
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="测试产品", field="免赔额",
+                formula_or_value="10000", unit="元",
+                quote="免赔额1万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-1",
+            ),
+            FactRecord(
+                product="测试产品", field="给付比例",
+                formula_or_value="80", unit="%",
+                quote="给付比例80%",
+                source_doc_id="1", source_node_id="n1", source_pages="1-1",
+            ),
+            FactRecord(
+                product="测试产品", field="最高限额",
+                formula_or_value="50000", unit="元",
+                quote="最高限额5万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-1",
+            ),
+        ]
+
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="计算医疗费用和免赔额下的赔付金额？",
+            options={"A": "a", "B": "b"}, answer_format="mcq", type="计算题",
+            number_conditions=[
+                {"kind": "total_expense", "value": 100000, "unit": "元",
+                 "subject": "总费用", "snippet": "总费用10万元", "source": "stem"},
+                {"kind": "medical_reimbursement", "value": 20000, "unit": "元",
+                 "subject": "医保报销", "snippet": "医保报销2万元", "source": "stem"},
+            ],
+        )
+
+        records = engine.compute_from_facts(parsed, facts)
+        assert len(records) == 1
+        # eligible = 100000 - 20000 - 10000 = 70000
+        # payout = 70000 * 0.8 = 56000, but cap=50000, so result=50000
+        assert records[0].result == 50000
+        assert records[0].inputs["payout_ratio"] == 80.0
+        assert records[0].inputs["cap"] == 50000
+
+    def test_empty_facts_returns_empty(self):
+        from agent.calculation import CalculationEngine
+
+        engine = CalculationEngine()
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="排序问题？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="计算题",
+        )
+        records = engine.compute_from_facts(parsed, [])
+        assert records == []
+
+    def test_no_relevant_facts_returns_empty(self):
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="产品A", field="现金价值",
+                formula_or_value="800000", unit="元",
+                quote="现金价值80万元",
+                source_doc_id="1", source_node_id="n1", source_pages="1-1",
+            ),
+        ]
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="排序问题？",
+            options={"A": "a", "B": "b"}, answer_format="mcq",
+            type="计算题",
+        )
+        # 现金价值 is not 身故保险金, so ranking compute finds nothing
+        records = engine.compute_from_facts(parsed, facts)
+        assert records == []
+
+    def test_ranking_formula_string_non_empty(self):
+        from agent.calculation import CalculationEngine, FactRecord
+
+        engine = CalculationEngine()
+        facts = [
+            FactRecord(
+                product="产品A", field="身故保险金",
+                formula_or_value="保单账户价值", unit="",
+                quote="保单账户价值",
+                source_doc_id="1", source_node_id="n1", source_pages="1-1",
+            ),
+        ]
+        parsed = ParsedQuestion(
+            qid="test", domain="insurance", split="A",
+            question="关于身故保险金的排序问题？",
+            options={"A": "a", "B": "b"}, answer_format="mcq", type="推理判断",
+            number_conditions=[
+                {"kind": "account_value", "value": 900000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "", "source": "stem"},
+            ],
+        )
+        records = engine.compute_from_facts(parsed, facts)
+        assert len(records) == 1
+        assert len(records[0].formula) > 0
+        assert "900000" in records[0].formula
+        assert ">" not in records[0].formula  # Sort of single item = no ">"

@@ -1042,3 +1042,218 @@ class TestPhaseBCallBudget:
         assert record.qid == "ins_a_001"
         assert record.answer in ("A", "B", "C", "D")
         assert "llm_budget_exhausted" in record.fallbacks
+
+
+# ===========================================================================
+# Phase D: Fact-matrix computation path routing
+# ===========================================================================
+
+
+class TestFactMatrixPipelineRouting:
+    """Tests that computation questions are routed to the fact-matrix path
+    and produce support-backed answers from synthesized evidence."""
+
+    def test_computation_question_routes_to_fact_matrix(
+        self, tmp_path: Path,
+    ) -> None:
+        """A ranking question triggers the fact-matrix path and produces
+        an answer with synthesized support evidence."""
+        output_root = tmp_path / "outputs"
+        config = AgentConfig(
+            output_root=output_root,
+            max_llm_calls_per_question=10,
+        )
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+        index_store = _make_index_store_mock()
+        token_meter = TokenMeter(logs_dir=config.logs_dir)
+
+        # Mock LLM returns fact-matrix style JSON (not evidence-style)
+        # Use quotes that are substrings of the mock page text (see
+        # _make_index_store_mock: "身故保险金 = max(已交保费, 基本保额×160%, 现金价值)"
+        # and "免赔额为10000元，超过部分按80%比例赔付。")
+        fact_response = {
+            "choices": [{"message": {"content": json.dumps({
+                "facts": [
+                    {
+                        "product": "平安智盈金生",
+                        "field": "身故保险金",
+                        "formula_or_value": "保单账户价值",
+                        "unit": "",
+                        "quote": "身故保险金 = max(已交保费",
+                    },
+                    {
+                        "product": "国寿增益宝",
+                        "field": "身故保险金",
+                        "formula_or_value": "基本保额*1.6",
+                        "unit": "",
+                        "quote": "基本保额×160%, 现金价值",
+                    },
+                    {
+                        "product": "国寿鑫享添盈",
+                        "field": "身故保险金",
+                        "formula_or_value": "已交保费-已领养老年金",
+                        "unit": "",
+                        "quote": "已交保费, 基本保额",
+                    },
+                    {
+                        "product": "平安富鸿金生",
+                        "field": "身故保险金",
+                        "formula_or_value": "已交保费-已领养老年金",
+                        "unit": "",
+                        "quote": "按合同约定给付",
+                    },
+                ]
+            })}}],
+            "model": "mock",
+            "usage": {"prompt_tokens": 200, "completion_tokens": 100, "total_tokens": 300},
+        }
+
+        # Small tree (3 nodes) -> tree retrieval skipped (prescreen)
+        # 2 candidate nodes -> 2 fact-matrix calls
+        mock_caller = MockApiCaller(responses=[fact_response, fact_response])
+        llm_client = LLMClient(model="mock", api_caller=mock_caller)
+
+        # Build a computation question (has "排序" keyword)
+        parsed = _make_parsed_question(
+            qid="ins_a_001",
+            question="根据以下产品身故保险金按降序排列，正确的排序是？",
+            type="推理判断",
+            options={
+                "A": "智盈金生(90万) > 增益宝(144万) > 富鸿金生(85万) > 鑫享添盈(80万)",
+                "B": "增益宝(144万) > 智盈金生(90万) > 富鸿金生(85万) > 鑫享添盈(80万)",
+                "C": "富鸿金生(85万) > 鑫享添盈(80万) > 增益宝(144万) > 智盈金生(90万)",
+                "D": "鑫享添盈(80万) > 富鸿金生(85万) > 智盈金生(90万) > 增益宝(144万)",
+            },
+            number_conditions=[
+                {"kind": "premium_paid", "value": 1000000, "unit": "元",
+                 "subject": "已交保费", "snippet": "已交保费100万元", "source": "stem"},
+                {"kind": "account_value", "value": 900000, "unit": "元",
+                 "subject": "保单账户价值", "snippet": "保单账户价值90万元", "source": "stem"},
+                {"kind": "basic_sum_insured", "value": 900000, "unit": "元",
+                 "subject": "基本保额", "snippet": "基本保额90万元", "source": "stem"},
+                {"kind": "annuity_received", "value": 200000, "unit": "元",
+                 "subject": "已领养老年金", "snippet": "已领养老年金20万元(source=鑫享添盈)", "source": "stem"},
+            ],
+        )
+
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=llm_client,
+            token_meter=token_meter,
+        )
+
+        # Should have produced a valid answer
+        assert record.qid == "ins_a_001"
+        assert record.answer in ("A", "B", "C", "D")
+        assert len(record.answer) == 1
+
+        # Should have used the fact-matrix path
+        assert "fact_matrix_path" in record.fallbacks, (
+            f"Expected fact_matrix_path in fallbacks, got {record.fallbacks}"
+        )
+
+        # Should have support evidence for the answer (synthesized from facts)
+        support_for_answer = [
+            e for e in record.evidence
+            if e.option == record.answer and e.evidence_type == "support"
+        ]
+        assert len(support_for_answer) >= 1, (
+            f"No support evidence for answer {record.answer}; "
+            f"evidence types: {[(e.option, e.evidence_type) for e in record.evidence]}"
+        )
+
+        # At least one support evidence should have a non-empty quote
+        has_quote = any(e.quote for e in support_for_answer)
+        assert has_quote, "Support evidence must have non-empty quote"
+
+        # Check that calculations are populated
+        assert len(record.calculations) >= 1
+        calc_types = {c["calc_type"] for c in record.calculations}
+        assert "ranking" in calc_types
+
+        # Verify _has_support_for_answer passes
+        from agent.pipeline import _has_support_for_answer
+        assert _has_support_for_answer(record, parsed), (
+            "Answer should have support evidence for the selected option"
+        )
+
+    def test_non_computation_question_uses_normal_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """A fact-query question without computation keywords uses the
+        normal evidence extraction path (not fact-matrix)."""
+        output_root = tmp_path / "outputs"
+        config = AgentConfig(
+            output_root=output_root,
+            max_llm_calls_per_question=10,
+        )
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        profile = get_profile("insurance")
+        catalog = _make_catalog_mock()
+        index_store = _make_index_store_mock()
+        token_meter = TokenMeter(logs_dir=config.logs_dir)
+
+        # Normal evidence-style response (per-option verdicts, not facts)
+        evidence_response = {
+            "choices": [{"message": {"content": json.dumps({
+                "verdicts": [
+                    {"option": "A", "evidence_type": "support",
+                     "quote": "身故保险金", "normalized_fact": "fact",
+                     "confidence": "high"},
+                    {"option": "B", "evidence_type": "unclear",
+                     "quote": "", "normalized_fact": "", "confidence": "low"},
+                    {"option": "C", "evidence_type": "unclear",
+                     "quote": "", "normalized_fact": "", "confidence": "low"},
+                    {"option": "D", "evidence_type": "unclear",
+                     "quote": "", "normalized_fact": "", "confidence": "low"},
+                ]
+            })}}],
+            "model": "mock",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        }
+
+        mock_caller = MockApiCaller(responses=[evidence_response, evidence_response])
+        llm_client = LLMClient(model="mock", api_caller=mock_caller)
+
+        # Non-computation question: no calc keywords, 事实查询 type
+        parsed = _make_parsed_question(
+            qid="ins_a_010",
+            question="某产品的保险责任是什么？",
+            type="事实查询",
+        )
+
+        record = run_question(
+            parsed,
+            config=config,
+            profile=profile,
+            catalog=catalog,
+            index_store=index_store,
+            llm_client=llm_client,
+            token_meter=token_meter,
+        )
+
+        assert record.qid == "ins_a_010"
+        assert record.answer in ("A", "B", "C", "D")
+
+        # Should NOT have fact_matrix_path in fallbacks
+        assert "fact_matrix_path" not in record.fallbacks, (
+            "Non-computation question should not use fact-matrix path"
+        )
+
+        # Should have evidence (from normal extraction)
+        assert len(record.evidence) >= 4
+
+        # Check that the LLM was called for evidence (not fact_matrix)
+        stages = {r.stage for r in token_meter._records}
+        assert "evidence" in stages, "Normal path should use evidence stage"
+        assert "fact_matrix" not in stages, (
+            "Non-computation question should not use fact_matrix stage"
+        )

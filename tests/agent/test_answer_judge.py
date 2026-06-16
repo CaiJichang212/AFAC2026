@@ -602,3 +602,278 @@ class TestEdgeCases:
         ]
         result = judge.judge(parsed, evidence)
         assert result.answer == "B"
+
+
+# ===========================================================================
+# Phase D: Computation-derived verdicts with synthesized support evidence
+# ===========================================================================
+
+
+class TestComputationDerivedVerdicts:
+    """Tests that the judge derives answers from calculation results and
+    synthesizes support EvidenceRecords for the selected option."""
+
+    def test_ranking_derives_answer_b_with_support_evidence(self):
+        """ins_a_001 scenario: ranking calc identifies option B, and the
+        judge synthesizes support EvidenceRecords with non-empty quotes."""
+        judge = AnswerJudge()
+        parsed = _make_parsed(
+            "mcq",
+            qid="ins_a_001",
+            question="根据以下产品身故保险金按降序排列，正确的排序是？",
+            options={
+                "A": "平安智盈金生(90万) > 国寿增益宝(144万) > 平安富鸿金生(85万) > 国寿鑫享添盈(80万)",
+                "B": "国寿增益宝(144万) > 平安智盈金生(90万) > 平安富鸿金生(85万) > 国寿鑫享添盈(80万)",
+                "C": "平安富鸿金生(85万) > 国寿鑫享添盈(80万) > 国寿增益宝(144万) > 平安智盈金生(90万)",
+                "D": "国寿鑫享添盈(80万) > 平安富鸿金生(85万) > 平安智盈金生(90万) > 国寿增益宝(144万)",
+            },
+        )
+
+        # Calculation with supporting facts embedded
+        calc = CalculationRecord(
+            qid="ins_a_001",
+            calc_type="ranking",
+            inputs={
+                "ranked_order": [
+                    "国寿增益宝", "平安智盈金生", "平安富鸿金生", "国寿鑫享添盈",
+                ],
+                "ranked_values": {
+                    "国寿增益宝": "1440000",
+                    "平安智盈金生": "900000",
+                    "平安富鸿金生": "850000",
+                    "国寿鑫享添盈": "800000",
+                },
+                "product_values": {
+                    "国寿增益宝": "1440000",
+                    "平安智盈金生": "900000",
+                    "平安富鸿金生": "850000",
+                    "国寿鑫享添盈": "800000",
+                },
+                "supporting_facts": [
+                    {
+                        "product": "国寿增益宝",
+                        "field": "身故保险金",
+                        "formula_or_value": "基本保额*1.6",
+                        "quote": "按基本保额的160%给付身故保险金",
+                        "source_doc_id": "2",
+                        "source_node_id": "n2",
+                        "source_pages": "4-6",
+                    },
+                    {
+                        "product": "平安智盈金生",
+                        "field": "身故保险金",
+                        "formula_or_value": "保单账户价值",
+                        "quote": "保单账户价值为90万元",
+                        "source_doc_id": "1",
+                        "source_node_id": "n1",
+                        "source_pages": "1-3",
+                    },
+                    {
+                        "product": "平安富鸿金生",
+                        "field": "身故保险金",
+                        "formula_or_value": "已交保费-已领养老年金",
+                        "quote": "按已交保费减去已领年金给付",
+                        "source_doc_id": "16",
+                        "source_node_id": "n16",
+                        "source_pages": "3-4",
+                    },
+                    {
+                        "product": "国寿鑫享添盈",
+                        "field": "身故保险金",
+                        "formula_or_value": "已交保费-已领养老年金",
+                        "quote": "已交保费扣除已领养老年金",
+                        "source_doc_id": "15",
+                        "source_node_id": "n15",
+                        "source_pages": "1-2",
+                    },
+                ],
+            },
+            formula="...",
+            result=0.0,
+            source_evidence_ids=["1/n1", "2/n2", "15/n15", "16/n16"],
+        )
+
+        # Start with empty evidence — judge must synthesize support from calc
+        result = judge.judge(parsed, [], [calc])
+
+        # Answer must be B
+        assert result.answer == "B", f"Expected B, got {result.answer}"
+
+        # Must have support evidence for B
+        support_for_b = [
+            e for e in result.evidence
+            if e.option == "B" and e.evidence_type == "support"
+        ]
+        assert len(support_for_b) >= 1, (
+            f"Expected >=1 support evidence for B, got {len(support_for_b)}"
+        )
+
+        # At least one support evidence must have a non-empty quote
+        has_quote = any(e.quote for e in support_for_b)
+        assert has_quote, "Support evidence for B must have non-empty quote"
+
+        # Verify the calculation_override fallback is present
+        assert any("calculation_override" in fb for fb in result.fallbacks), (
+            "Should have calculation_override fallback"
+        )
+
+    def test_ranking_derives_answer_with_synthesized_evidence_fields(self):
+        """Synthesized EvidenceRecords have correct doc_id/node_id/pages from facts."""
+        judge = AnswerJudge()
+        parsed = _make_parsed(
+            "mcq",
+            qid="test",
+            question="排序问题？",
+            options={
+                "A": "产品A > 产品B",
+                "B": "产品B > 产品A",
+                "C": "产品A = 产品B",
+                "D": "无法比较",
+            },
+        )
+
+        calc = CalculationRecord(
+            qid="test",
+            calc_type="ranking",
+            inputs={
+                "ranked_order": ["产品B", "产品A"],
+                "ranked_values": {"产品B": "100", "产品A": "50"},
+                "product_values": {"产品B": "100", "产品A": "50"},
+                "supporting_facts": [
+                    {
+                        "product": "产品B",
+                        "field": "身故保险金",
+                        "formula_or_value": "保单账户价值",
+                        "quote": "产品B的账户价值为100万",
+                        "source_doc_id": "10",
+                        "source_node_id": "n10",
+                        "source_pages": "5-7",
+                    },
+                ],
+            },
+            formula="...",
+            result=0.0,
+            source_evidence_ids=["10/n10"],
+        )
+
+        result = judge.judge(parsed, [], [calc])
+        assert result.answer == "B"
+
+        # Check synthesized evidence fields
+        support_evidence = [
+            e for e in result.evidence if e.evidence_type == "support"
+        ]
+        assert len(support_evidence) >= 1
+        se = support_evidence[0]
+        assert se.option == "B"
+        assert se.doc_id == "10"
+        assert se.node_id == "n10"
+        assert se.pages == "5-7"
+        assert se.quote == "产品B的账户价值为100万"
+        assert "产品B" in se.normalized_fact
+        assert se.confidence == "high"
+
+    def test_medical_calc_without_ranking_uses_evidence_path(self):
+        """Medical calculations without ranked_order should still work via
+        evidence-based path (no override)."""
+        judge = AnswerJudge()
+        parsed = _make_parsed("mcq")
+        evidence = [
+            _support_rec("C", "high"),
+            _unclear_rec("A"),
+            _unclear_rec("B"),
+            _unclear_rec("D"),
+        ]
+        calc = CalculationRecord(
+            qid="test",
+            calc_type="medical_payout",
+            inputs={
+                "product": "测试产品",
+                "deductible": 5000,
+                "supporting_facts": [
+                    {
+                        "product": "测试产品",
+                        "field": "免赔额",
+                        "formula_or_value": "5000",
+                        "quote": "年度免赔额5000元",
+                        "source_doc_id": "5",
+                        "source_node_id": "n5",
+                        "source_pages": "3-4",
+                    },
+                ],
+            },
+            formula="...",
+            result=45000,
+            unit="元",
+            source_evidence_ids=["5/n5"],
+        )
+        result = judge.judge(parsed, evidence, [calc])
+        # C has high support, medical calc doesn't override (no ranking)
+        assert result.answer == "C"
+
+        # But synthesized support should still be present for C from evidence
+        support_for_c = [
+            e for e in result.evidence
+            if e.option == "C" and e.evidence_type == "support"
+        ]
+        assert len(support_for_c) >= 1
+
+    def test_no_calculations_no_synthesis(self):
+        """Without calculations, no synthetic evidence is created."""
+        judge = AnswerJudge()
+        parsed = _make_parsed("mcq")
+        evidence = [_support_rec("A", "high")]
+        result = judge.judge(parsed, evidence, [])
+        assert result.answer == "A"
+        # All evidence should be from the input, not synthesized
+        assert len(result.evidence) == 1
+        assert result.evidence[0].option == "A"
+
+    def test_synthesized_evidence_passes_has_support_check(self):
+        """The synthesized support evidence satisfies _has_support_for_answer.
+        This is critical for the validator."""
+        from agent.pipeline import _has_support_for_answer
+
+        judge = AnswerJudge()
+        parsed = _make_parsed(
+            "mcq",
+            qid="test",
+            question="排序问题？",
+            options={
+                "A": "产品A > 产品B > 产品C > 产品D",
+                "B": "产品D > 产品C > 产品B > 产品A",
+                "C": "无法排序",
+                "D": "产品B > 产品D > 产品A > 产品C",
+            },
+        )
+
+        calc = CalculationRecord(
+            qid="test",
+            calc_type="ranking",
+            inputs={
+                "ranked_order": ["产品D", "产品C", "产品B", "产品A"],
+                "ranked_values": {"产品D": "400", "产品C": "300", "产品B": "200", "产品A": "100"},
+                "product_values": {"产品D": "400", "产品C": "300", "产品B": "200", "产品A": "100"},
+                "supporting_facts": [
+                    {
+                        "product": "产品D",
+                        "field": "身故保险金",
+                        "formula_or_value": "400",
+                        "quote": "产品D给付400万元",
+                        "source_doc_id": "4",
+                        "source_node_id": "n4",
+                        "source_pages": "1-2",
+                    },
+                ],
+            },
+            formula="...",
+            result=0.0,
+            source_evidence_ids=["4/n4"],
+        )
+
+        result = judge.judge(parsed, [], [calc])
+
+        # Check that has_support_for_answer passes
+        assert _has_support_for_answer(result, parsed), (
+            "Synthesized evidence should satisfy support check"
+        )

@@ -270,6 +270,83 @@ def _ranked_order_match_strength(ranked_order: list[str], option_text: str) -> i
 
 
 # ---------------------------------------------------------------------------
+# Phase D: Synthesize support evidence from computation results
+# ---------------------------------------------------------------------------
+
+
+def _synthesize_computation_evidence(
+    parsed: ParsedQuestion,
+    calculations: list[CalculationRecord],
+    answer: str,
+) -> list[EvidenceRecord]:
+    """Synthesize support EvidenceRecords from computation supporting facts.
+
+    When a calculation definitively identifies the answer (e.g. a ranking
+    whose ranked_order matches exactly one option), this function extracts
+    the ``supporting_facts`` embedded in CalculationRecord.inputs and
+    converts each fact's quote into a support EvidenceRecord for the
+    selected option.
+
+    Returns an empty list when no supporting facts are available or when
+    the calculation does not definitively identify an answer.
+    """
+    if not calculations or not answer:
+        return []
+
+    synthetic: list[EvidenceRecord] = []
+
+    for calc in calculations:
+        supporting_facts: list[dict[str, Any]] = (
+            calc.inputs.get("supporting_facts", [])
+        )
+        if not supporting_facts:
+            # Fallback for ranking: check per_product inputs
+            if calc.calc_type == "ranking":
+                per_product = calc.inputs.get("per_product", {})
+                for product, pinfo in per_product.items():
+                    # Create a minimal evidence record from formula info
+                    formula = pinfo.get("formula_or_value", "")
+                    synthetic.append(
+                        EvidenceRecord(
+                            qid=parsed.qid,
+                            doc_id="",
+                            node_id="",
+                            pages="",
+                            option=answer,
+                            evidence_type="support",
+                            quote=f"{product}: {formula}",
+                            normalized_fact=f"{product}身故保险金={formula}",
+                            numbers=[],
+                            confidence="high",
+                        )
+                    )
+            continue
+
+        for sf in supporting_facts:
+            quote = sf.get("quote", "")
+            product = sf.get("product", "")
+            field = sf.get("field", "")
+            formula_or_value = sf.get("formula_or_value", "")
+
+            synthetic.append(
+                EvidenceRecord(
+                    qid=parsed.qid,
+                    doc_id=sf.get("source_doc_id", ""),
+                    node_id=sf.get("source_node_id", ""),
+                    pages=sf.get("source_pages", ""),
+                    option=answer,
+                    evidence_type="support",
+                    quote=quote,
+                    normalized_fact=f"{product}: {field}={formula_or_value}",
+                    numbers=[],
+                    confidence="high",
+                )
+            )
+
+    return synthetic
+
+
+# ---------------------------------------------------------------------------
 # AnswerJudge
 # ---------------------------------------------------------------------------
 
@@ -332,6 +409,20 @@ class AnswerJudge:
                 "based on ranking calculation"
             )
             raw_answer = calc_answer
+
+        # 3b. Phase D: Computation-derived verdicts — when calculations
+        # carry definitive results (ranking order or medical payouts), derive
+        # the answer and synthesize support EvidenceRecords from the
+        # supporting facts embedded in calculation inputs.
+        calc_evidence = _synthesize_computation_evidence(
+            parsed, calculations, raw_answer
+        )
+        if calc_evidence:
+            # Merge synthesized support evidence into the evidence list so
+            # the validator's _has_support_for_answer check passes.
+            evidence = list(evidence) + calc_evidence
+            # Rebuild option judgements with the augmented evidence
+            option_judgements = _build_option_judgements(evidence, options)
 
         # 4. Normalise / correct to valid format
         if fmt == "mcq":

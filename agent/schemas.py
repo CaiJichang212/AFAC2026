@@ -102,6 +102,29 @@ class CalculationRecord:
 
 
 # ---------------------------------------------------------------------------
+# Fact matrix (Phase D)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FactRecord:
+    """A single extracted fact about a product from a document page.
+
+    Used by the fact-matrix computation path for calculation/ranking questions.
+    Each fact links a product to a numeric value or formula rule found in the
+    source document, with a verbatim quote for traceability.
+    """
+
+    product: str = ""          # canonical product name
+    field: str = ""            # 身故保险金 / 免赔额 / 给付比例 / 最高限额 / 基本保额 / ...
+    formula_or_value: str = "" # "保单账户价值" / "基本保额*1.6" / "已交保费-已领养老年金" / "5000"
+    unit: str = ""             # 元 / % / 倍 / ""
+    quote: str = ""            # verbatim snippet from page text
+    source_doc_id: str = ""    # doc_id this fact came from
+    source_node_id: str = ""   # node_id this fact came from
+    source_pages: str = ""     # page range
+
+
+# ---------------------------------------------------------------------------
 # Answer
 # ---------------------------------------------------------------------------
 

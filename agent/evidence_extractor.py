@@ -503,10 +503,341 @@ class EvidenceExtractor:
                 )
         return records
 
+    # ------------------------------------------------------------------
+    # Phase D: Fact-matrix extraction for computation questions
+    # ------------------------------------------------------------------
+
+    def extract_fact_matrix(
+        self,
+        parsed: ParsedQuestion,
+        candidates: list[CandidateNode],
+        index_store: IndexStore,
+        config: AgentConfig,
+        *,
+        llm_client: LLMClient | None = None,
+        token_meter: TokenMeter | None = None,
+        budget: "LLMBudget | None" = None,
+    ) -> list[FactRecord]:
+        """Extract per-product structured facts for computation questions.
+
+        For each candidate node, reads the page text and asks the LLM to
+        extract numeric facts and formula rules keyed by product.  Returns
+        a list of ``FactRecord`` with traceable quotes.
+
+        When no LLM client is available, the budget is exhausted, or all
+        calls fail, returns an empty list (caller should fall back to the
+        normal evidence extraction path).
+        """
+        from agent.schemas import FactRecord
+
+        all_facts: list[FactRecord] = []
+        llm_available = llm_client is not None
+
+        for candidate in candidates:
+            # --- resolve page text ---
+            try:
+                doc_id_int = int(candidate.doc_id)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Invalid doc_id %r for node %s; skipping fact extraction.",
+                    candidate.doc_id, candidate.node_id,
+                )
+                continue
+
+            page_range = candidate.page_range
+            if not page_range:
+                logger.warning(
+                    "Candidate %s has no page_range; skipping fact extraction.",
+                    candidate.node_id,
+                )
+                continue
+
+            pages = index_store.get_page_content(doc_id_int, page_range)
+            full_text = "\n".join(p.text for p in pages)
+            if not full_text.strip():
+                logger.warning(
+                    "No page text for %s doc %s pages %s; skipping fact extraction.",
+                    candidate.node_id, candidate.doc_id, page_range,
+                )
+                continue
+
+            # --- extract ---
+            if not llm_available:
+                continue  # no facts without LLM; caller falls back
+
+            # Check budget
+            if budget is not None and not budget.consume():
+                logger.info(
+                    "LLM call budget exhausted for %s during fact extraction.",
+                    candidate.node_id,
+                )
+                continue
+
+            try:
+                node_facts = self._extract_facts_from_node_llm(
+                    parsed=parsed,
+                    candidate=candidate,
+                    full_text=full_text,
+                    config=config,
+                    llm_client=llm_client,
+                    token_meter=token_meter,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fact extraction failed for %s: %s; skipping node.",
+                    candidate.node_id, exc,
+                )
+                continue
+
+            all_facts.extend(node_facts)
+
+        # Dedup: keep one fact per (product, field) preferring non-empty quote
+        all_facts = self._dedup_facts(all_facts)
+
+        return all_facts
+
+    def _extract_facts_from_node_llm(
+        self,
+        *,
+        parsed: ParsedQuestion,
+        candidate: CandidateNode,
+        full_text: str,
+        config: AgentConfig,
+        llm_client: LLMClient,
+        token_meter: TokenMeter | None,
+    ) -> list[FactRecord]:
+        """Call the LLM for one candidate node and parse fact JSON."""
+        from agent.schemas import FactRecord
+
+        messages = _build_fact_matrix_messages(
+            question=parsed.question,
+            page_text=full_text,
+            doc_id=candidate.doc_id,
+            node_title=candidate.title,
+        )
+
+        temperature = 0.6
+        t0 = time.monotonic()
+
+        try:
+            response: LLMResponse = llm_client.chat(
+                messages=messages,
+                json_schema=_FACT_MATRIX_JSON_SCHEMA,
+                temperature=temperature,
+                max_tokens=config.evidence_max_tokens,
+            )
+        except Exception as exc:
+            if token_meter is not None:
+                latency_ms = (time.monotonic() - t0) * 1000.0
+                token_meter.record(
+                    UsageRecord(
+                        qid=parsed.qid,
+                        stage="fact_matrix",
+                        model=config.inference_model,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=latency_ms,
+                        success=False,
+                        error=str(exc),
+                    )
+                )
+            raise
+
+        if token_meter is not None:
+            token_meter.record(
+                UsageRecord(
+                    qid=parsed.qid,
+                    stage="fact_matrix",
+                    model=response.model or config.inference_model,
+                    prompt_tokens=response.prompt_tokens,
+                    completion_tokens=response.completion_tokens,
+                    total_tokens=response.total_tokens,
+                    latency_ms=response.latency_ms,
+                    success=True,
+                )
+            )
+
+        return self._parse_fact_matrix_response(
+            raw_content=response.content,
+            parsed=parsed,
+            candidate=candidate,
+            full_text=full_text,
+        )
+
+    def _parse_fact_matrix_response(
+        self,
+        raw_content: str,
+        parsed: ParsedQuestion,
+        candidate: CandidateNode,
+        full_text: str,
+    ) -> list[FactRecord]:
+        """Parse the LLM JSON response into FactRecords."""
+        from agent.schemas import FactRecord
+
+        try:
+            data = json.loads(raw_content)
+        except json.JSONDecodeError as exc:
+            logger.warning("Fact matrix JSON parse failed: %s", exc)
+            return []
+
+        facts_raw: list[dict[str, Any]] = data.get("facts", [])
+        if not isinstance(facts_raw, list):
+            logger.warning("Fact matrix 'facts' is not a list; got %s", type(facts_raw).__name__)
+            return []
+
+        _VALID_FIELDS = frozenset({
+            "身故保险金", "免赔额", "给付比例", "最高限额",
+            "基本保额", "保单账户价值", "现金价值", "已交保费",
+            "已领养老年金", "总费用", "医保报销",
+        })
+
+        norm_full = _normalize_whitespace(full_text)
+        records: list[FactRecord] = []
+
+        for f in facts_raw:
+            if not isinstance(f, dict):
+                continue
+
+            product = str(f.get("product", "")).strip()
+            if not product:
+                continue
+
+            field = str(f.get("field", "")).strip()
+            if field not in _VALID_FIELDS:
+                continue
+
+            formula_or_value = str(f.get("formula_or_value", "")).strip()
+            unit = str(f.get("unit", "")).strip()
+            quote = str(f.get("quote", "")).strip()
+
+            # Traceability check: if quote is non-empty, verify it appears in
+            # the page text (whitespace-normalized substring match).  Downgrade
+            # quote to empty if not found — the fact is still usable but loses
+            # its traceability marker.
+            if quote and _normalize_whitespace(quote) not in norm_full:
+                logger.warning(
+                    "Fact quote not traceable for %s/%s in %s; clearing quote.",
+                    product, field, candidate.node_id,
+                )
+                quote = ""
+
+            records.append(
+                FactRecord(
+                    product=product,
+                    field=field,
+                    formula_or_value=formula_or_value,
+                    unit=unit,
+                    quote=quote,
+                    source_doc_id=candidate.doc_id,
+                    source_node_id=candidate.node_id,
+                    source_pages=candidate.page_range,
+                )
+            )
+
+        return records
+
+    @staticmethod
+    def _dedup_facts(facts: list[FactRecord]) -> list[FactRecord]:
+        """Deduplicate facts: keep one per (product, field).
+
+        When multiple facts exist for the same (product, field), prefer the
+        one with a non-empty quote.  Ties broken by first-encountered.
+        """
+        from agent.schemas import FactRecord
+
+        best: dict[tuple[str, str], FactRecord] = {}
+        for f in facts:
+            key = (f.product, f.field)
+            if key not in best:
+                best[key] = f
+            elif not best[key].quote and f.quote:
+                best[key] = f  # upgrade to traced fact
+        return list(best.values())
+
 
 # ---------------------------------------------------------------------------
-# Prompt builders (module-level for testability)
+# Phase D: Fact-matrix LLM prompt + JSON schema
 # ---------------------------------------------------------------------------
+
+_FACT_MATRIX_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "product": {"type": "string"},
+                    "field": {
+                        "type": "string",
+                        "enum": [
+                            "身故保险金", "免赔额", "给付比例", "最高限额",
+                            "基本保额", "保单账户价值", "现金价值", "已交保费",
+                            "已领养老年金", "总费用", "医保报销",
+                        ],
+                    },
+                    "formula_or_value": {"type": "string"},
+                    "unit": {"type": "string"},
+                    "quote": {"type": "string"},
+                },
+                "required": ["product", "field", "formula_or_value", "quote"],
+            },
+        }
+    },
+    "required": ["facts"],
+}
+
+
+def _build_fact_matrix_messages(
+    *,
+    question: str,
+    page_text: str,
+    doc_id: str,
+    node_title: str,
+) -> list[dict[str, Any]]:
+    """Build LLM messages for per-product fact extraction from one candidate node.
+
+    The LLM is instructed to extract structured facts (product, field,
+    formula_or_value, unit, quote) from the page text.  Each fact captures
+    one numeric parameter or formula rule for a specific insurance product.
+    """
+    system_prompt = (
+        "你是一个保险条款分析助手。你的任务是从提供的保险文档页面中，"
+        "提取每个产品相关的**结构化事实**（数值参数或计算公式规则）。\n\n"
+        "规则：\n"
+        "1. 为每个出现在页面中的产品，提取其关键保险参数。\n"
+        "2. field 必须从以下词汇中选择：身故保险金 / 免赔额 / 给付比例 / 最高限额 / "
+        "基本保额 / 保单账户价值 / 现金价值 / 已交保费 / 已领养老年金 / 总费用 / 医保报销。\n"
+        "3. formula_or_value 的格式：\n"
+        "   - 如果是**计算公式规则**，用简短表达式表示，例如：\n"
+        "     身故保险金=保单账户价值  → formula_or_value=\"保单账户价值\"\n"
+        "     身故保险金=基本保额×1.6  → formula_or_value=\"基本保额*1.6\"\n"
+        "     身故保险金=已交保费−已领养老年金 → formula_or_value=\"已交保费-已领养老年金\"\n"
+        "   - 如果是**具体数值**（如免赔额5000元），直接写数值：\"5000\"\n"
+        "   - 运算符只允许 * (乘) 和 - (减)。\n"
+        "4. unit 只在 field 对应具体数值时填写（元/%/倍），公式规则时可为空。\n"
+        "5. quote 必须是从页面文本中逐字复制的**简短原文片段**（≤80字），只摘录最相关的一句。\n"
+        "6. 一个产品可以有多个事实（如同时有身故保险金规则和基本保额数值）。\n"
+        "7. 只输出与问题相关的产品事实，不要输出无关产品。\n\n"
+        "重要：只输出 JSON 对象本身，不要加 markdown 代码围栏（```json），"
+        "不要加任何解释、前言或后记。"
+    )
+
+    user_prompt = (
+        f"文档ID: {doc_id}\n"
+        f"章节标题: {node_title}\n\n"
+        f"问题:\n{question}\n\n"
+        f"--- 以下为文档页面原文 ---\n"
+        f"{page_text}\n"
+        f"--- 文档页面原文结束 ---\n\n"
+        f"请基于以上页面原文，提取每个产品的结构化事实。"
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
 
 def _build_evidence_messages(
