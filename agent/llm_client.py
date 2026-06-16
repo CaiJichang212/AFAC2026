@@ -190,16 +190,3 @@ class LLMClient:
             raise ValueError(f"Expected JSON object but got {type(parsed).__name__}")
         if schema.get("type") == "array" and not isinstance(parsed, list):
             raise ValueError(f"Expected JSON array but got {type(parsed).__name__}")
-
-
-# ---------------------------------------------------------------------------
-# Convenience factory
-# ---------------------------------------------------------------------------
-
-
-def create_client(config: "AgentConfig") -> LLMClient:  # noqa: F821
-    """Create an LLMClient from an AgentConfig.
-
-    Import is deferred to avoid circular imports.
-    """
-    return LLMClient(model=config.inference_model)

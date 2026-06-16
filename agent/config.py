@@ -129,22 +129,41 @@ class AgentConfig:
     def from_env(cls) -> "AgentConfig":
         """Build an AgentConfig from environment variables.
 
-        Environment variables:
-            AFAC_DOMAIN, AFAC_SPLIT, AFAC_RAW_ROOT, AFAC_QUESTIONS_ROOT,
-            AFAC_PROCESSED_ROOT, AFAC_PAGEINDEX_ROOT, AFAC_OUTPUT_ROOT,
-            AFAC_INFERENCE_MODEL, AFAC_DEV_MODEL
+        Every dataclass field is covered: the field's default is used unless
+        an AFAC_* env var is set, in which case the value is parsed according
+        to the field type (int / float / Path / str).
+
+        Environment variable names follow the pattern AFAC_<FIELD_NAME>.
         """
-        return cls(
-            domain=os.environ.get("AFAC_DOMAIN", "insurance"),
-            split=os.environ.get("AFAC_SPLIT", "A"),
-            raw_root=Path(os.environ.get("AFAC_RAW_ROOT", "data/public_dataset_upload/raw")),
-            questions_root=Path(os.environ.get("AFAC_QUESTIONS_ROOT", "data/public_dataset_upload/questions")),
-            processed_root=Path(os.environ.get("AFAC_PROCESSED_ROOT", "data/processed_data")),
-            pageindex_root=Path(os.environ.get("AFAC_PAGEINDEX_ROOT", "open_projects/PageIndex")),
-            output_root=Path(os.environ.get("AFAC_OUTPUT_ROOT", "outputs")),
-            inference_model=os.environ.get("AFAC_INFERENCE_MODEL", "dashscope/qwen3.6-plus"),
-            dev_model=os.environ.get("AFAC_DEV_MODEL") or None,
-        )
+        import typing
+
+        hints = typing.get_type_hints(cls)
+        kwargs: dict[str, object] = {}
+
+        for name, ftype in hints.items():
+            env_var = f"AFAC_{name.upper()}"
+            value = os.environ.get(env_var)
+            if value is None:
+                continue  # keep the dataclass default
+
+            # Unwrap Optional[X] -> X for parsing
+            origin = typing.get_origin(ftype)
+            if origin is not None:
+                args = typing.get_args(ftype)
+                non_none = [a for a in args if a is not type(None)]
+                if non_none:
+                    ftype = non_none[0]
+
+            if ftype is int:
+                kwargs[name] = int(value)
+            elif ftype is float:
+                kwargs[name] = float(value)
+            elif ftype is Path:
+                kwargs[name] = Path(value)
+            else:
+                kwargs[name] = value
+
+        return cls(**kwargs)
 
 
 def add_cli_arguments(parser: argparse.ArgumentParser) -> None:

@@ -211,3 +211,21 @@ class TestFromEnv:
         cfg = AgentConfig.from_env()
         assert cfg.domain == "regulatory"
         assert cfg.split == "B"
+
+    def test_from_env_overrides_budget_params(self, monkeypatch) -> None:
+        """Setting AFAC_MAX_DOCS_PER_QUESTION and another budget field
+        via env vars must change the config value."""
+        monkeypatch.setenv("AFAC_MAX_DOCS_PER_QUESTION", "5")
+        monkeypatch.setenv("AFAC_MAX_RETRY_PER_QUESTION", "3")
+        cfg = AgentConfig.from_env()
+        assert cfg.max_docs_per_question == 5
+        assert cfg.max_retry_per_question == 3
+
+    def test_from_env_unset_budget_keeps_default(self, monkeypatch) -> None:
+        """An unset env var must leave the dataclass default untouched."""
+        # Ensure the env var is NOT set
+        monkeypatch.delenv("AFAC_MAX_DOCS_PER_QUESTION", raising=False)
+        monkeypatch.delenv("AFAC_MAX_NODES_PER_DOC", raising=False)
+        cfg = AgentConfig.from_env()
+        assert cfg.max_docs_per_question == 4  # default
+        assert cfg.max_nodes_per_doc == 5  # default

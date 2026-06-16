@@ -44,7 +44,7 @@ class CandidateNode:
     doc_id: str
     node_id: str
     title: str
-    page_range: tuple[int, int] | None = None  # (start, end) 1-indexed
+    page_range: str = ""  # "start-end" string format, e.g. "6-8" or single page "6"
     matched_signals: list[str] = field(default_factory=list)
     reason: str = ""
     needs_page_fetch: bool = True
@@ -61,7 +61,7 @@ class EvidenceRecord:
     qid: str
     doc_id: str
     node_id: str
-    pages: list[int] = field(default_factory=list)  # page numbers referenced
+    pages: str = ""  # "start-end" string format, e.g. "6-8" or single page "6"
     option: str = ""  # which option this evidence relates to
     evidence_type: str = "unclear"  # "support" | "refute" | "unclear"
     quote: str = ""
@@ -98,8 +98,8 @@ class AnswerRecord:
 class UsageRecord:
     """Token usage for a single LLM call."""
 
-    qid: str = ""
-    stage: str = ""  # e.g. "preprocess", "pageindex", "retrieval", "evidence", "judge"
+    qid: str
+    stage: str  # e.g. "preprocess", "pageindex", "retrieval", "evidence", "judge"
     model: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
