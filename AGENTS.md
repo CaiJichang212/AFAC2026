@@ -9,6 +9,7 @@
 3. 不修改 `open_projects/PageIndex` 源码。PageIndex 作为上游源码依赖使用；项目侧适配、封装、脚本和测试应放在本项目根目录下。
 4. 不提交、打印或写入 API Key、密钥、评测标准答案、隐藏测试信息。
 5. 生成物、缓存、日志和实验输出应写入 `data/processed_data`、`outputs` 或用户指定目录，不要混入 `data/public_dataset_upload` 原始赛题数据目录。
+6. 测试暂时使用火山Coding Plan的`ark-code-latest`模型。
 
 ## Current Task Scope
 
