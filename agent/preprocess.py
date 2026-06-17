@@ -11,6 +11,8 @@ from agent.config import AgentConfig
 from agent.schemas import PageText
 
 TITLE_PATTERNS = (
+    r"^\d+(?:\.\d+)*\s*[\u4e00-\u9fff]",
+    r"^[\u4e00-\u9fff]{2,12}$",
     r"^第[一二三四五六七八九十百千0-9]+[章节编条]",
     r"^第[一二三四五六七八九十百千0-9]+条",
     r"^保险责任",
@@ -33,6 +35,17 @@ def _looks_like_title(line: str) -> bool:
     return any(re.search(pattern, stripped) for pattern in TITLE_PATTERNS)
 
 
+def _heading_level(line: str) -> int:
+    stripped = line.strip()
+    if re.match(r"^\d+\.\d+\.\d+", stripped):
+        return 4
+    if re.match(r"^\d+\.\d+", stripped):
+        return 3
+    if re.match(r"^\d+", stripped):
+        return 2
+    return 2
+
+
 def _extract_page_text(doc: fitz.Document, page_num: int) -> str:
     page = doc[page_num - 1]
     text = page.get_text("text")
@@ -49,7 +62,10 @@ def _build_markdown_lines(page_texts: list[PageText]) -> tuple[list[str], dict[s
             continue
         title_lines = [line for line in lines if _looks_like_title(line)]
         for line in lines:
-            markdown_lines.append(line)
+            if _looks_like_title(line):
+                markdown_lines.append(f"{'#' * _heading_level(line)} {line}")
+            else:
+                markdown_lines.append(line)
             line_to_page[str(len(markdown_lines))] = page_text.page
         if title_lines:
             markdown_lines.append("")
