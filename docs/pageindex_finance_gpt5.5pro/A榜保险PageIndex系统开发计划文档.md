@@ -10,6 +10,16 @@
 
 ---
 
+## 0. 当前实现状态
+
+截至当前 `dev-a-insurance-codex` 分支，本计划已落地一版可复现规则基线：
+
+- 已实现 `agent/` 通用模块、`scripts/` CLI、`tests/agent` 单元测试。
+- 已生成 `data/processed_data/pages`、`markdown`、`pageindex`、`catalog` 和 `quality` 本地产物。
+- 已生成 `outputs/insurance_a/answer.csv`、`evidence.jsonl`、`logs/usage.jsonl` 并通过 `scripts/validate_outputs.py` 校验。
+- 当前 `pipeline` 默认使用规则化证据抽取和答案格式化，外部 Qwen JSON 调用入口保留在 `agent/llm_client.py`，正式接入模型时必须通过 `TokenMeter` 记录 usage。
+- 项目命令统一使用 `uv run ...`，不要直接运行系统 `python` 或 `pytest`。
+
 ## 1. Scope And Ground Truth
 
 当前计划只覆盖以下范围：
