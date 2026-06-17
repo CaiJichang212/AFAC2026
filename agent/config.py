@@ -17,6 +17,8 @@ class AgentConfig:
     pageindex_root: Path = Path("open_projects/PageIndex")
     output_root: Path = Path("outputs")
     inference_model: str = "dashscope/qwen3.6-plus"
+    answer_mode: str = "auto"
+    expected_model: str | None = None
     dev_model: str | None = None
     toc_check_page_num: int = 20
     max_page_num_each_node: int = 8
@@ -111,6 +113,8 @@ class AgentConfig:
             pageindex_root=Path(namespace.pageindex_root),
             output_root=Path(namespace.output_root),
             inference_model=namespace.inference_model,
+            answer_mode=namespace.answer_mode,
+            expected_model=namespace.expected_model,
             dev_model=namespace.dev_model,
             toc_check_page_num=namespace.toc_check_page_num,
             max_page_num_each_node=namespace.max_page_num_each_node,
@@ -151,6 +155,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--inference-model",
         default=os.getenv("AFAC_INFERENCE_MODEL", "dashscope/qwen3.6-plus"),
     )
+    parser.add_argument(
+        "--answer-mode",
+        choices=("auto", "llm", "rules"),
+        default=os.getenv("AFAC_ANSWER_MODE", "auto"),
+        help="Answer generation mode: auto uses LLM when credentials exist, llm requires it, rules disables it.",
+    )
+    parser.add_argument("--expected-model", default=os.getenv("AFAC_EXPECTED_MODEL"))
     parser.add_argument("--dev-model", default=os.getenv("AFAC_DEV_MODEL"))
     parser.add_argument("--toc-check-page-num", type=int, default=20)
     parser.add_argument("--max-page-num-each-node", type=int, default=8)

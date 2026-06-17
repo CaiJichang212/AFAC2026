@@ -20,6 +20,7 @@ def test_agent_config_exposes_pageindex_and_retrieval_defaults() -> None:
     config = AgentConfig()
 
     assert config.inference_model == "dashscope/qwen3.6-plus"
+    assert config.answer_mode == "auto"
     assert config.toc_check_page_num == 20
     assert config.max_page_num_each_node == 8
     assert config.max_token_num_each_node == 20000
@@ -51,3 +52,11 @@ def test_output_dir_uses_lowercase_split_suffix() -> None:
     config = AgentConfig(split="A")
 
     assert config.output_dir == Path("outputs/insurance_a")
+
+
+def test_agent_config_parses_answer_mode() -> None:
+    config = AgentConfig.from_args(
+        ["--domain", "insurance", "--split", "A", "--answer-mode", "llm"]
+    )
+
+    assert config.answer_mode == "llm"

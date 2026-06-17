@@ -37,6 +37,15 @@ uv run python scripts/validate_outputs.py --domain insurance --split A
 - `outputs/insurance_a/evidence.jsonl`
 - `outputs/insurance_a/logs/usage.jsonl`
 
+开发调试阶段如需强制使用火山 Coding Plan 模型生成答案，可运行：
+
+```bash
+uv run python scripts/run_answers.py --domain insurance --split A --output-root=outputs/ark-code-latest --inference-model=ark-code-latest --answer-mode=llm
+uv run python scripts/validate_outputs.py --domain insurance --split A --output-root=outputs/ark-code-latest --expected-model=ark-code-latest
+```
+
+`--answer-mode=auto` 为默认模式：当配置的模型能从环境变量解析到 API Key 时使用 LLM，否则回退到规则基线；`--answer-mode=rules` 可强制离线规则基线。
+
 ## 验证
 
 ```bash

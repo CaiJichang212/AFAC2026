@@ -11,14 +11,16 @@ from agent.doc_retriever import DocRetriever
 from agent.domain_profiles import get_domain_profile
 from agent.evidence_extractor import EvidenceExtractor
 from agent.index_store import IndexStore
+from agent.llm_client import JsonTransport, LLMClient, LLMClientError
+from agent.llm_transport import create_openai_compatible_transport
 from agent.question_parser import QuestionParser
-from agent.schemas import EvidenceRecord, UsageRecord
+from agent.schemas import AnswerRecord, CalculationRecord, EvidenceRecord, ParsedQuestion, UsageRecord
 from agent.token_meter import TokenMeter
 from agent.tree_retriever import TreeRetriever
 
 
 class Pipeline:
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(self, config: AgentConfig, llm_transport: JsonTransport | None = None) -> None:
         self.config = config
         self.profile = get_domain_profile(config.domain)
         self.parser = QuestionParser(self.profile)
@@ -34,8 +36,19 @@ class Pipeline:
         self.calculation_engine = CalculationEngine()
         self.answer_judge = AnswerJudge()
         self.token_meter = TokenMeter()
+        if llm_transport is None and config.answer_mode != "rules":
+            llm_transport = create_openai_compatible_transport(config.inference_model)
+        self.llm_client = (
+            LLMClient(model=config.inference_model, transport=llm_transport)
+            if llm_transport is not None
+            else None
+        )
 
     def run(self) -> dict[str, int]:
+        if self.config.answer_mode == "llm" and self.llm_client is None:
+            raise RuntimeError(
+                f"LLM transport is not configured for model {self.config.inference_model}."
+            )
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.config.logs_dir.mkdir(parents=True, exist_ok=True)
         if not self.config.catalog_path.exists():
@@ -67,20 +80,33 @@ class Pipeline:
             answer = self.answer_judge.judge(parsed, evidence, calculations)
             evidence = _ensure_selected_support(parsed.qid, answer.answer, evidence, selected_nodes)
             answer = self.answer_judge.judge(parsed, evidence, calculations)
-            answers[parsed.qid] = answer.answer
-            self.token_meter.record(
-                UsageRecord(
-                    qid=parsed.qid,
-                    stage="rules_pipeline",
-                    model="rules",
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    total_tokens=0,
-                    latency_ms=0,
-                    success=True,
-                    error=None,
+            fallbacks: list[str] = []
+            if self._should_use_llm():
+                answer = self._generate_llm_answer(
+                    parsed=parsed,
+                    candidate_docs=candidate_docs,
+                    selected_nodes=selected_nodes,
+                    evidence=evidence,
+                    calculations=calculations,
+                    rules_answer=answer,
+                    fallbacks=fallbacks,
                 )
-            )
+                evidence = _ensure_selected_support(parsed.qid, answer.answer, evidence, selected_nodes)
+            else:
+                self.token_meter.record(
+                    UsageRecord(
+                        qid=parsed.qid,
+                        stage="rules_pipeline",
+                        model="rules",
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=0,
+                        success=True,
+                        error=None,
+                    )
+                )
+            answers[parsed.qid] = answer.answer
             audit_records.append(
                 {
                     "qid": parsed.qid,
@@ -90,7 +116,7 @@ class Pipeline:
                     "evidence": [asdict(record) for record in evidence],
                     "calculations": [asdict(record) for record in calculations],
                     "usage": self.token_meter.summarize_qid(parsed.qid).to_dict(),
-                    "fallbacks": [],
+                    "fallbacks": fallbacks,
                     "warnings": answer.warnings,
                     "option_judgements": answer.option_judgements,
                 }
@@ -102,6 +128,59 @@ class Pipeline:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.token_meter.write_usage_log(self.config.logs_dir / "usage.jsonl")
         return {"question_count": len(raw_questions), "answer_count": len(answers)}
+
+    def _should_use_llm(self) -> bool:
+        if self.config.answer_mode == "rules":
+            return False
+        return self.llm_client is not None
+
+    def _generate_llm_answer(
+        self,
+        *,
+        parsed: ParsedQuestion,
+        candidate_docs: list[str],
+        selected_nodes: list[dict],
+        evidence: list[EvidenceRecord],
+        calculations: list[CalculationRecord],
+        rules_answer: AnswerRecord,
+        fallbacks: list[str],
+    ) -> AnswerRecord:
+        if self.llm_client is None:
+            raise RuntimeError(
+                f"LLM transport is not configured for model {self.config.inference_model}."
+            )
+        try:
+            response = self.llm_client.generate_json(
+                qid=parsed.qid,
+                stage="llm_answer",
+                prompt=_build_answer_prompt(
+                    parsed=parsed,
+                    candidate_docs=candidate_docs,
+                    selected_nodes=selected_nodes,
+                    evidence=evidence,
+                    calculations=calculations,
+                    rules_answer=rules_answer,
+                ),
+                json_schema=_ANSWER_JSON_SCHEMA,
+                temperature=0.0,
+            )
+        except LLMClientError as exc:
+            self.token_meter.record(
+                UsageRecord(
+                    qid=parsed.qid,
+                    stage="llm_answer",
+                    model=self.config.inference_model,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    latency_ms=0,
+                    success=False,
+                    error=str(exc),
+                )
+            )
+            raise RuntimeError(f"LLM answer generation failed for {parsed.qid}: {exc}") from exc
+        self.token_meter.record(response.usage)
+        return _answer_from_llm_content(parsed, response.content, rules_answer, fallbacks)
 
 
 def _ensure_selected_support(
@@ -131,6 +210,93 @@ def _ensure_selected_support(
             )
         )
     return patched
+
+
+_ANSWER_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answer": {"type": "string"},
+        "option_judgements": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["answer", "option_judgements"],
+}
+
+
+def _build_answer_prompt(
+    *,
+    parsed: ParsedQuestion,
+    candidate_docs: list[str],
+    selected_nodes: list[dict],
+    evidence: list[EvidenceRecord],
+    calculations: list[CalculationRecord],
+    rules_answer: AnswerRecord,
+) -> str:
+    payload = {
+        "qid": parsed.qid,
+        "domain": parsed.domain,
+        "split": parsed.split,
+        "question": parsed.question,
+        "answer_format": parsed.answer_format,
+        "options": parsed.options,
+        "allowed_doc_ids": candidate_docs,
+        "selected_nodes": selected_nodes,
+        "evidence": [asdict(record) for record in evidence],
+        "calculations": [asdict(record) for record in calculations],
+        "rules_answer": asdict(rules_answer),
+    }
+    return (
+        "请只根据 allowed_doc_ids 对应的证据回答选择题。"
+        "答案只能由 options 中的选项字母组成；单选只输出一个字母，多选按字母升序拼接。"
+        "若证据不足，选择最受证据支持的选项并在 warnings 中说明。\n\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _answer_from_llm_content(
+    parsed: ParsedQuestion,
+    content: dict,
+    rules_answer: AnswerRecord,
+    fallbacks: list[str],
+) -> AnswerRecord:
+    valid_options = set(parsed.options)
+    warnings = [str(item) for item in content.get("warnings", []) if str(item)]
+    answer = _coerce_answer(
+        raw_answer=str(content.get("answer", "")),
+        valid_options=valid_options,
+        answer_format=parsed.answer_format,
+    )
+    if not answer:
+        answer = rules_answer.answer
+        warnings.append("llm_invalid_answer_fallback")
+        fallbacks.append("rules_answer")
+    option_judgements_raw = content.get("option_judgements", {})
+    option_judgements = {
+        option: str(option_judgements_raw.get(option, "unclear"))
+        for option in sorted(valid_options)
+    }
+    return AnswerRecord(
+        qid=parsed.qid,
+        answer=answer,
+        option_judgements=option_judgements,
+        warnings=warnings,
+    )
+
+
+def _coerce_answer(raw_answer: str, valid_options: set[str], answer_format: str) -> str:
+    letters = [letter for letter in raw_answer.upper() if letter in valid_options]
+    if answer_format in {"mcq", "tf"}:
+        return letters[0] if letters else ""
+    if answer_format == "multi":
+        return "".join(sorted(dict.fromkeys(letters)))
+    return letters[0] if letters else ""
 
 
 def run_pipeline(config: AgentConfig) -> dict[str, int]:

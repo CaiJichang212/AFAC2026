@@ -6,7 +6,11 @@ import json
 from agent.config import AgentConfig
 
 
-def validate_outputs(config: AgentConfig, expected_qids: list[str] | None = None) -> None:
+def validate_outputs(
+    config: AgentConfig,
+    expected_qids: list[str] | None = None,
+    expected_model: str | None = None,
+) -> None:
     if expected_qids is None:
         questions = json.loads(config.questions_path.read_text(encoding="utf-8"))
         expected_qids = [item["qid"] for item in questions]
@@ -24,6 +28,8 @@ def validate_outputs(config: AgentConfig, expected_qids: list[str] | None = None
     row_total = sum(int(row["total_tokens"]) for row in answer_rows[1:])
     if summary_total != row_total:
         raise ValueError("summary total_tokens must equal question row total")
+    if expected_model is not None and summary_total <= 0:
+        raise ValueError(f"expected model {expected_model} requires positive total_tokens")
 
     evidence_by_qid = {}
     for line in config.evidence_path.read_text(encoding="utf-8").splitlines():
@@ -46,10 +52,30 @@ def validate_outputs(config: AgentConfig, expected_qids: list[str] | None = None
             if not support:
                 raise ValueError(f"{qid} selected option {option} missing support evidence")
 
+    if expected_model is not None:
+        usage_path = config.logs_dir / "usage.jsonl"
+        if not usage_path.exists():
+            raise ValueError(f"expected model {expected_model} requires usage.jsonl")
+        usage_rows = [
+            json.loads(line)
+            for line in usage_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        expected_rows = [
+            row
+            for row in usage_rows
+            if row.get("model") == expected_model and row.get("success") is True
+        ]
+        if not expected_rows:
+            raise ValueError(f"expected model {expected_model} missing from usage log")
+        expected_total = sum(int(row.get("total_tokens", 0)) for row in expected_rows)
+        if expected_total <= 0:
+            raise ValueError(f"expected model {expected_model} usage total_tokens must be positive")
+
 
 def main(argv: list[str] | None = None) -> int:
     config = AgentConfig.from_args(argv)
-    validate_outputs(config)
+    validate_outputs(config, expected_model=config.expected_model)
     print(
         json.dumps(
             {
@@ -58,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
                 "split": config.split,
                 "answers_path": str(config.answers_path),
                 "evidence_path": str(config.evidence_path),
+                "expected_model": config.expected_model,
             },
             ensure_ascii=False,
         )
