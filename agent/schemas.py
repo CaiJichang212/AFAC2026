@@ -49,6 +49,15 @@ class ParsedQuestion:
 
 
 @dataclass(frozen=True)
+class PageText:
+    doc_id: str
+    page: int
+    text: str
+    char_count: int
+    source_path: str
+
+
+@dataclass(frozen=True)
 class CandidateNode:
     doc_id: str
     node_id: str
