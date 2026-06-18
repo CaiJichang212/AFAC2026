@@ -121,6 +121,9 @@ def test_pipeline_uses_configured_llm_model_and_records_usage(tmp_path: Path) ->
 
     assert result == {"question_count": 1, "answer_count": 1}
     assert [call["model"] for call in calls] == ["ark-code-latest"]
+    assert "不得把目录、阅读指引、泛化标题当作充分证据" in calls[0]["prompt"]
+    assert "证据不足时不要强行猜测" in calls[0]["prompt"]
+    assert "若证据不足，选择最受证据支持的选项" not in calls[0]["prompt"]
     usage_rows = [
         json.loads(line)
         for line in (config.logs_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()

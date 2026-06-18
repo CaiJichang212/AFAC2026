@@ -32,3 +32,35 @@ def test_tree_retriever_returns_bounded_candidate_nodes() -> None:
     assert all(candidate.page_range for candidate in candidates)
     assert all(candidate.reason for candidate in candidates)
     assert not any("support" in candidate.reason.lower() for candidate in candidates)
+
+
+def test_tree_retriever_adds_keyword_page_candidates_from_page_text() -> None:
+    config = AgentConfig()
+    profile = get_domain_profile("insurance")
+    parsed = QuestionParser(profile).parse(
+        {
+            "qid": "demo",
+            "domain": "insurance",
+            "split": "A",
+            "question": "平安智盈金生的身故保险金如何按保单账户价值计算？",
+            "options": {"A": "领取日前身故按保单账户价值给付", "B": "无关选项"},
+            "answer_format": "mcq",
+            "type": "事实查询",
+            "doc_ids": ["1"],
+        }
+    )
+
+    store = IndexStore(config)
+    retriever = TreeRetriever(store, profile, max_nodes_per_doc=8, max_pages_per_doc=8)
+    candidates = retriever.retrieve(parsed, "1")
+
+    assert any(
+        candidate.node_id == "page-4"
+        and candidate.page_range == "4-4"
+        and "页文本关键词" in candidate.reason
+        for candidate in candidates
+    )
+    page_ranges = [candidate.page_range for candidate in candidates]
+    assert page_ranges.index("4-4") < 3
+    if "1-1" in page_ranges:
+        assert page_ranges.index("4-4") < page_ranges.index("1-1")

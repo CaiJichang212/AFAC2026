@@ -74,7 +74,7 @@ class Pipeline:
                     }
                     for candidate in candidates
                 )
-                evidence.extend(self.evidence_extractor.extract(parsed, candidates[:1]))
+                evidence.extend(self.evidence_extractor.extract(parsed, candidates))
 
             calculations = self.calculation_engine.compute(parsed, evidence)
             answer = self.answer_judge.judge(parsed, evidence, calculations)
@@ -255,7 +255,11 @@ def _build_answer_prompt(
     return (
         "请只根据 allowed_doc_ids 对应的证据回答选择题。"
         "答案只能由 options 中的选项字母组成；单选只输出一个字母，多选按字母升序拼接。"
-        "若证据不足，选择最受证据支持的选项并在 warnings 中说明。\n\n"
+        "证据必须直接引用条款规则、公式、赔付条件、免责条件或可代入计算的数值；"
+        "不得把目录、阅读指引、泛化标题当作充分证据。"
+        "证据不足时不要强行猜测；请优先采用 rules_answer 中由已标注 support 的证据推出的答案，"
+        "并在 warnings 中写明 missing_direct_evidence 或 needs_more_retrieval。"
+        "如果某选项没有直接证据支撑，option_judgements 中应标为 unclear 或 refute，不得标为 support。\n\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 

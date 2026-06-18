@@ -7,6 +7,22 @@ from typing import Any
 
 from agent.config import AgentConfig
 
+PAGE_SUBSTANTIVE_MARKERS = (
+    "按",
+    "给付",
+    "等于",
+    "扣除",
+    "比例",
+    "不承担",
+    "不接受",
+    "退还",
+    "不得",
+    "最高不超过",
+    "计算",
+    "赔付",
+)
+PAGE_PREFACE_MARKERS = ("阅读指引", "条款目录")
+
 
 @dataclass(frozen=True)
 class DocumentMetadata:
@@ -118,6 +134,45 @@ class IndexStore:
             record = json.loads(line)
             if record["page"] in page_nums:
                 results.append(record)
+        return results
+
+    def search_page_content(
+        self, doc_id: str, terms: list[str], max_pages: int = 5
+    ) -> list[dict[str, Any]]:
+        page_file = self.config.pages_dir / f"{doc_id}.jsonl"
+        if not page_file.exists():
+            return []
+        unique_terms = [
+            term.strip()
+            for term in dict.fromkeys(terms)
+            if term and len(term.strip()) >= 2
+        ]
+        if not unique_terms:
+            return []
+
+        scored: list[tuple[int, dict[str, Any], list[str]]] = []
+        for line in page_file.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            text = str(record.get("text", ""))
+            matched = [term for term in unique_terms if term in text]
+            if not matched:
+                continue
+            occurrence_score = sum(text.count(term) for term in matched)
+            score = len(matched) * 15 + min(occurrence_score, 10)
+            if any(marker in text for marker in PAGE_SUBSTANTIVE_MARKERS):
+                score += 12
+            if any(marker in text for marker in PAGE_PREFACE_MARKERS):
+                score -= 25
+            scored.append((score, record, matched))
+
+        results: list[dict[str, Any]] = []
+        for score, record, matched in sorted(scored, key=lambda item: item[0], reverse=True):
+            enriched = dict(record)
+            enriched["matched_terms"] = matched
+            enriched["score"] = score
+            results.append(enriched)
+            if len(results) >= max_pages:
+                break
         return results
 
 
